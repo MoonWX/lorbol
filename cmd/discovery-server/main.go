@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -14,7 +15,9 @@ type Node struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	VirtualIP string `json:"virtual_ip"`
-	PublicIP  string `json:"public_ip"`
+	PublicIPv4 string `json:"public_ipv4,omitempty"`
+	PublicIPv6 string `json:"public_ipv6,omitempty"`
+	PublicIP  string `json:"public_ip"` // 保留兼容性
 	Port      int    `json:"port"`
 	Network   string `json:"network"`
 	Timestamp int64  `json:"timestamp"`
@@ -46,6 +49,15 @@ func (ds *DiscoveryServer) registerNode(w http.ResponseWriter, r *http.Request) 
 	// Set timestamp
 	node.Timestamp = time.Now().Unix()
 
+	// Ensure compatibility: if only PublicIP is set, determine if it's IPv4 or IPv6
+	if node.PublicIPv4 == "" && node.PublicIPv6 == "" && node.PublicIP != "" {
+		if strings.Contains(node.PublicIP, ":") {
+			node.PublicIPv6 = node.PublicIP
+		} else {
+			node.PublicIPv4 = node.PublicIP
+		}
+	}
+
 	// Create unique key: network:id
 	key := fmt.Sprintf("%s:%s", node.Network, node.ID)
 
@@ -53,7 +65,8 @@ func (ds *DiscoveryServer) registerNode(w http.ResponseWriter, r *http.Request) 
 	ds.nodes[key] = &node
 	ds.mu.Unlock()
 
-	log.Printf("Registered node: %s (%s) in network %s", node.Name, node.PublicIP, node.Network)
+	log.Printf("Registered node: %s (IPv4:%s, IPv6:%s) in network %s", 
+		node.Name, node.PublicIPv4, node.PublicIPv6, node.Network)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})

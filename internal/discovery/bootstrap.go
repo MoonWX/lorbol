@@ -25,7 +25,9 @@ type Node struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
 	VirtualIP string `json:"virtual_ip"`
-	PublicIP  string `json:"public_ip"`
+	PublicIPv4 string `json:"public_ipv4,omitempty"`
+	PublicIPv6 string `json:"public_ipv6,omitempty"`
+	PublicIP  string `json:"public_ip"` // 保留兼容性，自动选择最佳IP
 	Port      int    `json:"port"`
 	Network   string `json:"network"`
 	Timestamp int64  `json:"timestamp"`

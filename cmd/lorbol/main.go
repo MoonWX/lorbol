@@ -83,15 +83,32 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		Timestamp: time.Now().Unix(),
 	}
 
-	// Auto-detect public IP if not specified
+	// Auto-detect public IPs if not specified
 	if cfg.Node.PublicIP == "" {
-		if detectedIP, err := detectPublicIP(); err == nil {
-			localNode.PublicIP = detectedIP
+		ipv4, ipv6, err := detectPublicIPs()
+		if err != nil {
+			log.Printf("Warning: failed to detect public IPs: %v", err)
 		} else {
-			log.Printf("Warning: failed to detect public IP: %v", err)
+			localNode.PublicIPv4 = ipv4
+			localNode.PublicIPv6 = ipv6
+			// Set primary PublicIP to IPv4 if available, otherwise IPv6
+			if ipv4 != "" {
+				localNode.PublicIP = ipv4
+			} else {
+				localNode.PublicIP = ipv6
+			}
+			log.Printf("Detected public IPs - IPv4: %s, IPv6: %s", ipv4, ipv6)
 		}
 	} else {
 		localNode.PublicIP = cfg.Node.PublicIP
+		// Determine if configured IP is IPv4 or IPv6
+		if parsedIP := net.ParseIP(cfg.Node.PublicIP); parsedIP != nil {
+			if parsedIP.To4() != nil {
+				localNode.PublicIPv4 = cfg.Node.PublicIP
+			} else {
+				localNode.PublicIPv6 = cfg.Node.PublicIP
+			}
+		}
 	}
 
 	// Create TUN interface
@@ -273,15 +290,12 @@ func (s *Server) processPeers() {
 	for _, peer := range peers {
 		log.Printf("Checking peer: %s (ID:%s, PublicIP:%s, VirtualIP:%s)", peer.Name, peer.ID, peer.PublicIP, peer.VirtualIP)
 		
-		if peer.ID != s.localNode.ID && peer.PublicIP != "" {
-			// Handle IPv6 addresses properly
-			var endpoint string
-			if strings.Contains(peer.PublicIP, ":") {
-				// IPv6 address needs brackets
-				endpoint = fmt.Sprintf("[%s]:%d", peer.PublicIP, peer.Port)
-			} else {
-				// IPv4 address
-				endpoint = fmt.Sprintf("%s:%d", peer.PublicIP, peer.Port)
+		if peer.ID != s.localNode.ID && (peer.PublicIPv4 != "" || peer.PublicIPv6 != "") {
+			// Choose best endpoint based on availability and latency
+			bestEndpoint := s.chooseBestEndpoint(peer)
+			if bestEndpoint == "" {
+				log.Printf("No reachable endpoint for peer %s", peer.Name)
+				continue
 			}
 			
 			// For static peers, we need to set their virtual IP from our knowledge
@@ -312,8 +326,8 @@ func (s *Server) processPeers() {
 				}
 				
 				if !peerExists {
-					log.Printf("Adding peer to tunnel: %s -> %s (virtual: %s)", peer.Name, endpoint, virtualIP.String())
-					if err := s.tunnel.AddPeer(peer.ID, endpoint, virtualIP); err != nil {
+					log.Printf("Adding peer to tunnel: %s -> %s (virtual: %s)", peer.Name, bestEndpoint, virtualIP.String())
+					if err := s.tunnel.AddPeer(peer.ID, bestEndpoint, virtualIP); err != nil {
 						log.Printf("failed to add peer %s: %v", peer.Name, err)
 					} else {
 						log.Printf("successfully added peer: %s (%s)", peer.Name, virtualIP.String())
@@ -387,18 +401,24 @@ func (s *Server) forwardPackets(ctx context.Context) {
 	}
 }
 
-func detectPublicIP() (string, error) {
-	// Use HTTP service to get real public IP
-	services := []string{
-		"https://ifconfig.me/ip",
-		"https://ipinfo.io/ip", 
+func detectPublicIPs() (ipv4 string, ipv6 string, err error) {
+	// IPv4 detection services
+	ipv4Services := []string{
+		"https://ipv4.icanhazip.com",
 		"https://api.ipify.org",
 		"https://checkip.amazonaws.com",
 	}
 	
+	// IPv6 detection services  
+	ipv6Services := []string{
+		"https://ipv6.icanhazip.com",
+		"https://api6.ipify.org",
+	}
+	
 	client := &http.Client{Timeout: 10 * time.Second}
 	
-	for _, service := range services {
+	// Try to get IPv4
+	for _, service := range ipv4Services {
 		resp, err := client.Get(service)
 		if err != nil {
 			continue
@@ -412,11 +432,138 @@ func detectPublicIP() (string, error) {
 			}
 			
 			ip := strings.TrimSpace(string(body))
-			if net.ParseIP(ip) != nil {
-				return ip, nil
+			if parsedIP := net.ParseIP(ip); parsedIP != nil && parsedIP.To4() != nil {
+				ipv4 = ip
+				break
 			}
 		}
 	}
 	
-	return "", fmt.Errorf("failed to detect public IP from all services")
+	// Try to get IPv6
+	for _, service := range ipv6Services {
+		resp, err := client.Get(service)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == 200 {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				continue
+			}
+			
+			ip := strings.TrimSpace(string(body))
+			if parsedIP := net.ParseIP(ip); parsedIP != nil && parsedIP.To4() == nil {
+				ipv6 = ip
+				break
+			}
+		}
+	}
+	
+	if ipv4 == "" && ipv6 == "" {
+		return "", "", fmt.Errorf("failed to detect any public IP")
+	}
+	
+	return ipv4, ipv6, nil
+}
+
+func (s *Server) chooseBestEndpoint(peer *discovery.Node) string {
+	var candidates []struct {
+		endpoint string
+		isIPv6   bool
+	}
+	
+	// Add IPv4 endpoint if available and we have IPv4 connectivity
+	if peer.PublicIPv4 != "" && s.localNode.PublicIPv4 != "" {
+		candidates = append(candidates, struct {
+			endpoint string
+			isIPv6   bool
+		}{
+			endpoint: fmt.Sprintf("%s:%d", peer.PublicIPv4, peer.Port),
+			isIPv6:   false,
+		})
+	}
+	
+	// Add IPv6 endpoint if available and we have IPv6 connectivity  
+	if peer.PublicIPv6 != "" && s.localNode.PublicIPv6 != "" {
+		candidates = append(candidates, struct {
+			endpoint string
+			isIPv6   bool
+		}{
+			endpoint: fmt.Sprintf("[%s]:%d", peer.PublicIPv6, peer.Port),
+			isIPv6:   true,
+		})
+	}
+	
+	// If no candidates, fall back to legacy PublicIP
+	if len(candidates) == 0 && peer.PublicIP != "" {
+		if strings.Contains(peer.PublicIP, ":") {
+			candidates = append(candidates, struct {
+				endpoint string
+				isIPv6   bool
+			}{
+				endpoint: fmt.Sprintf("[%s]:%d", peer.PublicIP, peer.Port),
+				isIPv6:   true,
+			})
+		} else {
+			candidates = append(candidates, struct {
+				endpoint string
+				isIPv6   bool
+			}{
+				endpoint: fmt.Sprintf("%s:%d", peer.PublicIP, peer.Port),
+				isIPv6:   false,
+			})
+		}
+	}
+	
+	if len(candidates) == 0 {
+		return ""
+	}
+	
+	// Test latency for each candidate and choose the best one
+	bestEndpoint := ""
+	bestLatency := time.Hour // Start with very high latency
+	
+	for _, candidate := range candidates {
+		latency, err := s.testEndpointLatency(candidate.endpoint)
+		if err != nil {
+			log.Printf("Failed to test latency to %s: %v", candidate.endpoint, err)
+			continue
+		}
+		
+		log.Printf("Latency to %s: %v", candidate.endpoint, latency)
+		
+		if latency < bestLatency {
+			bestLatency = latency
+			bestEndpoint = candidate.endpoint
+		}
+	}
+	
+	// If no endpoint responded, return the first candidate (prefer IPv4)
+	if bestEndpoint == "" {
+		log.Printf("No endpoints responded, using first candidate: %s", candidates[0].endpoint)
+		return candidates[0].endpoint
+	}
+	
+	log.Printf("Chose best endpoint for %s: %s (latency: %v)", peer.Name, bestEndpoint, bestLatency)
+	return bestEndpoint
+}
+
+func (s *Server) testEndpointLatency(endpoint string) (time.Duration, error) {
+	start := time.Now()
+	
+	conn, err := net.DialTimeout("udp", endpoint, 3*time.Second)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	
+	// Send a test packet
+	_, err = conn.Write([]byte("ping"))
+	if err != nil {
+		return 0, err
+	}
+	
+	return time.Since(start), nil
 }

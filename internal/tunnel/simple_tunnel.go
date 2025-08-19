@@ -65,14 +65,34 @@ func (st *SimpleTunnel) SetDataReceivedCallback(callback func([]byte)) {
 }
 
 func (st *SimpleTunnel) Start() error {
-	addr := &net.UDPAddr{
-		IP:   net.IPv4zero,
+	// Try to listen on both IPv4 and IPv6 if available
+	// First try IPv6 (dual-stack), then fallback to IPv4 only
+	var conn *net.UDPConn
+	var err error
+	
+	// Try IPv6 dual-stack first
+	addr6 := &net.UDPAddr{
+		IP:   net.IPv6zero,
 		Port: st.listenPort,
 	}
-
-	conn, err := net.ListenUDP("udp", addr)
+	
+	conn, err = net.ListenUDP("udp6", addr6)
 	if err != nil {
-		return fmt.Errorf("failed to listen on UDP port %d: %w", st.listenPort, err)
+		fmt.Printf("SimpleTunnel: IPv6 listen failed, trying IPv4: %v\n", err)
+		
+		// Fallback to IPv4 only
+		addr4 := &net.UDPAddr{
+			IP:   net.IPv4zero,
+			Port: st.listenPort,
+		}
+		
+		conn, err = net.ListenUDP("udp4", addr4)
+		if err != nil {
+			return fmt.Errorf("failed to listen on UDP port %d (both IPv4 and IPv6): %w", st.listenPort, err)
+		}
+		fmt.Printf("SimpleTunnel: Listening on IPv4 only: %s\n", addr4.String())
+	} else {
+		fmt.Printf("SimpleTunnel: Listening on IPv6 dual-stack: %s\n", addr6.String())
 	}
 
 	st.conn = conn
