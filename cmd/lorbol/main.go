@@ -72,9 +72,10 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		return nil, fmt.Errorf("invalid virtual IP: %s", cfg.Node.VirtualIP)
 	}
 
-	// Create local node
+	// Create local node with stable ID based on name and virtual IP
+	// This prevents duplicate registrations on restarts
 	localNode := &discovery.Node{
-		ID:        fmt.Sprintf("%s-%d", cfg.Node.Name, time.Now().Unix()),
+		ID:        fmt.Sprintf("%s-%s", cfg.Node.Name, virtualIP.String()),
 		Name:      cfg.Node.Name,
 		VirtualIP: virtualIP.String(),
 		PublicIP:  "", // Will be detected or set from config
@@ -298,20 +299,13 @@ func (s *Server) processPeers() {
 				continue
 			}
 			
-			// For static peers, we need to set their virtual IP from our knowledge
-			// Since static discovery doesn't know their virtual IP initially
+			// Parse peer's virtual IP
 			var virtualIP net.IP
 			if peer.VirtualIP != "" {
 				virtualIP = net.ParseIP(peer.VirtualIP)
 			} else {
-				// Assign virtual IP based on the peer
-				// This is a temporary solution - in real implementation,
-				// virtual IPs should be exchanged during handshake
-				if peer.PublicIP == "47.245.15.86" {
-					virtualIP = net.ParseIP("10.100.0.3")
-				} else if peer.PublicIP == "8.211.175.127" {
-					virtualIP = net.ParseIP("10.100.0.2")
-				}
+				log.Printf("Warning: Peer %s has no virtual IP, skipping", peer.Name)
+				continue
 			}
 			
 			if virtualIP != nil {

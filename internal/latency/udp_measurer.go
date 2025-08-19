@@ -33,10 +33,7 @@ func (u *UDPMeasurer) MeasureLatency(targetIP net.IP, endpoint string) (time.Dur
 		return 0, err
 	}
 	
-	// Try to read response (this may fail for most cases, but we measure connection time)
-	conn.SetReadDeadline(time.Now().Add(u.timeout))
-	buffer := make([]byte, 4)
-	conn.Read(buffer) // Ignore errors, we're just measuring connection latency
-	
+	// Measure connection establishment time only
+	// Don't wait for response since there's no ping-pong protocol implemented
 	return time.Since(start), nil
 }
