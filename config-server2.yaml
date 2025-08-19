@@ -10,6 +10,7 @@ network:
 node:
   name: "server-2"              # 节点名称 - 必须与其他节点不同
   virtual_ip: "10.100.0.3"     # 虚拟IP地址 - 必须与其他节点不同
+  public_ip: "47.245.15.86"    # 公网IP地址 - 服务器2的实际IP
   listen_port: 51820           # UDP监听端口
 
 # 节点发现配置

@@ -10,6 +10,7 @@ network:
 node:
   name: "server-1"              # 节点名称
   virtual_ip: "10.100.0.2"     # 虚拟IP地址
+  public_ip: "8.211.175.127"   # 公网IP地址 - 服务器1的实际IP
   listen_port: 51820           # UDP监听端口
 
 # 节点发现配置
@@ -17,7 +18,7 @@ bootstrap:
   method: "static"              # 使用静态配置发现节点
   config:
     static_peers:              # 其他节点的公网地址
-      - "服务器2的公网IP:51820"   # 替换为实际IP
+      - "47.245.15.86:51820"   # 服务器2的实际IP
       # - "1.2.3.4:51820"      # 可以添加更多节点
 
 # TUN接口配置  

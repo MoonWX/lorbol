@@ -4,10 +4,13 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -105,14 +108,39 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	// Create bootstrap discovery service
 	var bootstrapURLs []string
-	if cfg.Bootstrap.Method == "static" {
-		// For static method, we'll handle peers directly
-		bootstrapURLs = []string{}
-	} else {
-		// For other methods, use default URLs for now
-		bootstrapURLs = []string{}
-	}
 	discoveryService := discovery.NewBootstrapService(localNode, bootstrapURLs)
+	
+	// Handle static peer configuration
+	if cfg.Bootstrap.Method == "static" {
+		if staticPeersInterface, exists := cfg.Bootstrap.Config["static_peers"]; exists {
+			if staticPeers, ok := staticPeersInterface.([]interface{}); ok {
+				for _, peerInterface := range staticPeers {
+					if peerStr, ok := peerInterface.(string); ok {
+						// Parse peer endpoint (e.g., "8.211.175.127:51820")
+						parts := strings.Split(peerStr, ":")
+						if len(parts) == 2 {
+							publicIP := parts[0]
+							var port int
+							if _, err := fmt.Sscanf(parts[1], "%d", &port); err == nil {
+								// Create a static peer node
+								staticPeer := &discovery.Node{
+									ID:        fmt.Sprintf("static-%s", publicIP),
+									Name:      fmt.Sprintf("static-peer-%s", publicIP),
+									VirtualIP: "", // Will be discovered during handshake
+									PublicIP:  publicIP,
+									Port:      port,
+									Network:   cfg.Network.Name,
+									Timestamp: time.Now().Unix(),
+								}
+								discoveryService.AddKnownPeer(staticPeer)
+								log.Printf("Added static peer: %s:%d", publicIP, port)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// Create latency measurer
 	measurer := latency.NewUDPMeasurer(cfg.Latency.Interval, cfg.Latency.Timeout)
@@ -252,13 +280,35 @@ func (s *Server) forwardPackets(ctx context.Context) {
 }
 
 func detectPublicIP() (string, error) {
-	// Try to detect public IP by connecting to a remote server
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "", err
+	// Use HTTP service to get real public IP
+	services := []string{
+		"https://ifconfig.me/ip",
+		"https://ipinfo.io/ip", 
+		"https://api.ipify.org",
+		"https://checkip.amazonaws.com",
 	}
-	defer conn.Close()
-
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String(), nil
+	
+	client := &http.Client{Timeout: 10 * time.Second}
+	
+	for _, service := range services {
+		resp, err := client.Get(service)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+		
+		if resp.StatusCode == 200 {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				continue
+			}
+			
+			ip := strings.TrimSpace(string(body))
+			if net.ParseIP(ip) != nil {
+				return ip, nil
+			}
+		}
+	}
+	
+	return "", fmt.Errorf("failed to detect public IP from all services")
 }

@@ -220,7 +220,7 @@ func (bs *BootstrapService) AddKnownPeer(node *Node) {
 	bs.knownPeers[node.ID] = &PeerInfo{
 		Node:      node,
 		LastSeen:  time.Now(),
-		Reachable: false, // Will be tested
+		Reachable: true, // Assume static peers are reachable initially
 		Endpoint:  fmt.Sprintf("%s:%d", node.PublicIP, node.Port),
 	}
 }
