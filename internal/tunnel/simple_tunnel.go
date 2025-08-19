@@ -1,0 +1,404 @@
+package tunnel
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
+)
+
+// SimpleTunnel implements a basic encrypted UDP tunnel without WireGuard dependency
+type SimpleTunnel struct {
+	localIP    net.IP
+	listenPort int
+	conn       *net.UDPConn
+	peers      map[string]*TunnelPeer
+	mu         sync.RWMutex
+	cipher     []byte // 32-byte key for ChaCha20Poly1305
+}
+
+type TunnelPeer struct {
+	ID       string
+	Endpoint *net.UDPAddr
+	VirtualIP net.IP
+	SharedKey []byte
+	LastSeen  time.Time
+	IsActive  bool
+}
+
+type TunnelPacket struct {
+	Type      uint8  // 1=handshake, 2=data, 3=keepalive
+	Nonce     [12]byte
+	Payload   []byte
+}
+
+type HandshakePacket struct {
+	NodeID    string
+	VirtualIP string
+	Timestamp int64
+	Signature []byte
+}
+
+func NewSimpleTunnel(localIP net.IP, listenPort int) (*SimpleTunnel, error) {
+	// Generate random encryption key
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return nil, fmt.Errorf("failed to generate encryption key: %w", err)
+	}
+
+	return &SimpleTunnel{
+		localIP:    localIP,
+		listenPort: listenPort,
+		peers:      make(map[string]*TunnelPeer),
+		cipher:     key,
+	}, nil
+}
+
+func (st *SimpleTunnel) Start() error {
+	addr := &net.UDPAddr{
+		IP:   net.IPv4zero,
+		Port: st.listenPort,
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on UDP port %d: %w", st.listenPort, err)
+	}
+
+	st.conn = conn
+
+	go st.handleIncomingPackets()
+	go st.keepaliveLoop()
+
+	return nil
+}
+
+func (st *SimpleTunnel) Stop() error {
+	if st.conn != nil {
+		return st.conn.Close()
+	}
+	return nil
+}
+
+func (st *SimpleTunnel) AddPeer(nodeID string, endpoint string, virtualIP net.IP) error {
+	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		return fmt.Errorf("invalid endpoint %s: %w", endpoint, err)
+	}
+
+	// Generate shared key based on node IDs (simplified)
+	sharedKey := st.generateSharedKey(nodeID)
+
+	peer := &TunnelPeer{
+		ID:        nodeID,
+		Endpoint:  udpAddr,
+		VirtualIP: virtualIP,
+		SharedKey: sharedKey,
+		LastSeen:  time.Now(),
+		IsActive:  false,
+	}
+
+	st.mu.Lock()
+	st.peers[nodeID] = peer
+	st.mu.Unlock()
+
+	// Send handshake
+	return st.sendHandshake(peer)
+}
+
+func (st *SimpleTunnel) RemovePeer(nodeID string) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	
+	delete(st.peers, nodeID)
+	return nil
+}
+
+func (st *SimpleTunnel) SendData(dstIP net.IP, data []byte) error {
+	// Find peer by virtual IP
+	st.mu.RLock()
+	var targetPeer *TunnelPeer
+	for _, peer := range st.peers {
+		if peer.VirtualIP.Equal(dstIP) && peer.IsActive {
+			targetPeer = peer
+			break
+		}
+	}
+	st.mu.RUnlock()
+
+	if targetPeer == nil {
+		return fmt.Errorf("no active peer found for IP %s", dstIP)
+	}
+
+	return st.sendEncryptedData(targetPeer, data)
+}
+
+func (st *SimpleTunnel) handleIncomingPackets() {
+	buffer := make([]byte, 1500)
+
+	for {
+		n, addr, err := st.conn.ReadFromUDP(buffer)
+		if err != nil {
+			continue
+		}
+
+		packet := buffer[:n]
+		if len(packet) < 13 { // Minimum packet size
+			continue
+		}
+
+		packetType := packet[0]
+		nonce := packet[1:13]
+		payload := packet[13:]
+
+		switch packetType {
+		case 1: // Handshake
+			st.handleHandshake(addr, nonce, payload)
+		case 2: // Data
+			st.handleDataPacket(addr, nonce, payload)
+		case 3: // Keepalive
+			st.handleKeepalive(addr)
+		}
+	}
+}
+
+func (st *SimpleTunnel) handleHandshake(addr *net.UDPAddr, nonce []byte, payload []byte) {
+	// Find peer by endpoint
+	st.mu.RLock()
+	var peer *TunnelPeer
+	for _, p := range st.peers {
+		if p.Endpoint.String() == addr.String() {
+			peer = p
+			break
+		}
+	}
+	st.mu.RUnlock()
+
+	if peer == nil {
+		return // Unknown peer
+	}
+
+	// Decrypt handshake payload
+	decrypted, err := st.decrypt(peer.SharedKey, nonce, payload)
+	if err != nil {
+		return
+	}
+
+	// Parse handshake
+	var handshake HandshakePacket
+	if err := st.parseHandshake(decrypted, &handshake); err != nil {
+		return
+	}
+
+	// Verify handshake
+	if handshake.NodeID == peer.ID {
+		st.mu.Lock()
+		peer.IsActive = true
+		peer.LastSeen = time.Now()
+		st.mu.Unlock()
+
+		// Send handshake response
+		st.sendHandshake(peer)
+	}
+}
+
+func (st *SimpleTunnel) handleDataPacket(addr *net.UDPAddr, nonce []byte, payload []byte) {
+	// Find active peer
+	st.mu.RLock()
+	var peer *TunnelPeer
+	for _, p := range st.peers {
+		if p.Endpoint.String() == addr.String() && p.IsActive {
+			peer = p
+			break
+		}
+	}
+	st.mu.RUnlock()
+
+	if peer == nil {
+		return
+	}
+
+	// Decrypt data
+	decrypted, err := st.decrypt(peer.SharedKey, nonce, payload)
+	if err != nil {
+		return
+	}
+
+	// Update last seen
+	st.mu.Lock()
+	peer.LastSeen = time.Now()
+	st.mu.Unlock()
+
+	// Forward decrypted data to TUN interface
+	// This would be handled by the TUN interface manager
+	_ = decrypted
+}
+
+func (st *SimpleTunnel) handleKeepalive(addr *net.UDPAddr) {
+	st.mu.Lock()
+	for _, peer := range st.peers {
+		if peer.Endpoint.String() == addr.String() {
+			peer.LastSeen = time.Now()
+			break
+		}
+	}
+	st.mu.Unlock()
+}
+
+func (st *SimpleTunnel) sendHandshake(peer *TunnelPeer) error {
+	handshake := HandshakePacket{
+		NodeID:    "local-node", // This should be the actual local node ID
+		VirtualIP: st.localIP.String(),
+		Timestamp: time.Now().Unix(),
+	}
+
+	data, err := st.serializeHandshake(&handshake)
+	if err != nil {
+		return err
+	}
+
+	return st.sendEncryptedPacket(peer, 1, data)
+}
+
+func (st *SimpleTunnel) sendEncryptedData(peer *TunnelPeer, data []byte) error {
+	return st.sendEncryptedPacket(peer, 2, data)
+}
+
+func (st *SimpleTunnel) sendEncryptedPacket(peer *TunnelPeer, packetType uint8, data []byte) error {
+	// Generate random nonce
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+
+	// Encrypt payload
+	encrypted, err := st.encrypt(peer.SharedKey, nonce, data)
+	if err != nil {
+		return err
+	}
+
+	// Build packet
+	packet := make([]byte, 1+12+len(encrypted))
+	packet[0] = packetType
+	copy(packet[1:13], nonce)
+	copy(packet[13:], encrypted)
+
+	// Send packet
+	_, err = st.conn.WriteToUDP(packet, peer.Endpoint)
+	return err
+}
+
+func (st *SimpleTunnel) encrypt(key, nonce, plaintext []byte) ([]byte, error) {
+	cipher, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
+
+	return cipher.Seal(nil, nonce, plaintext, nil), nil
+}
+
+func (st *SimpleTunnel) decrypt(key, nonce, ciphertext []byte) ([]byte, error) {
+	cipher, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
+	}
+
+	return cipher.Open(nil, nonce, ciphertext, nil)
+}
+
+func (st *SimpleTunnel) generateSharedKey(nodeID string) []byte {
+	// Simple key derivation based on node IDs
+	// In production, use proper key exchange (ECDH, etc.)
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", "local-node", nodeID)))
+	return hash[:]
+}
+
+func (st *SimpleTunnel) serializeHandshake(hs *HandshakePacket) ([]byte, error) {
+	// Simple binary serialization
+	data := make([]byte, 0, 1024)
+	data = append(data, []byte(hs.NodeID)...)
+	data = append(data, 0) // Null separator
+	data = append(data, []byte(hs.VirtualIP)...)
+	data = append(data, 0) // Null separator
+	
+	timestamp := make([]byte, 8)
+	binary.BigEndian.PutUint64(timestamp, uint64(hs.Timestamp))
+	data = append(data, timestamp...)
+	
+	return data, nil
+}
+
+func (st *SimpleTunnel) parseHandshake(data []byte, hs *HandshakePacket) error {
+	// Simple binary deserialization
+	parts := make([][]byte, 0, 3)
+	start := 0
+	
+	for i, b := range data {
+		if b == 0 && len(parts) < 2 {
+			parts = append(parts, data[start:i])
+			start = i + 1
+		}
+	}
+	
+	if len(parts) < 2 || len(data) < start+8 {
+		return fmt.Errorf("invalid handshake data")
+	}
+	
+	hs.NodeID = string(parts[0])
+	hs.VirtualIP = string(parts[1])
+	hs.Timestamp = int64(binary.BigEndian.Uint64(data[start:start+8]))
+	
+	return nil
+}
+
+func (st *SimpleTunnel) keepaliveLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		st.mu.RLock()
+		for _, peer := range st.peers {
+			if peer.IsActive {
+				// Send keepalive
+				st.sendEncryptedPacket(peer, 3, []byte{})
+			}
+		}
+		st.mu.RUnlock()
+
+		// Remove inactive peers
+		st.cleanupInactivePeers()
+	}
+}
+
+func (st *SimpleTunnel) cleanupInactivePeers() {
+	timeout := 2 * time.Minute
+	now := time.Now()
+
+	st.mu.Lock()
+	for _, peer := range st.peers {
+		if now.Sub(peer.LastSeen) > timeout {
+			peer.IsActive = false
+			// Could remove completely if needed
+		}
+	}
+	st.mu.Unlock()
+}
+
+func (st *SimpleTunnel) GetActivePeers() []*TunnelPeer {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+
+	var activePeers []*TunnelPeer
+	for _, peer := range st.peers {
+		if peer.IsActive {
+			activePeers = append(activePeers, peer)
+		}
+	}
+
+	return activePeers
+}

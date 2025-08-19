@@ -38,6 +38,7 @@ const (
 	MessageTypeRouteUpdate MessageType = "route_update"
 	MessageTypeDiscovery   MessageType = "discovery"
 	MessageTypeLatency     MessageType = "latency"
+	MessageTypeKeyExchange MessageType = "key_exchange"
 )
 
 type Message struct {
@@ -77,6 +78,12 @@ type RouteInfo struct {
 	HopCount    int           `json:"hop_count"`
 }
 
+type KeyExchangeData struct {
+	PublicKey string `json:"public_key"`
+	Endpoint  string `json:"endpoint"`
+	NodeID    string `json:"node_id"`
+}
+
 func NewP2PProtocol(localNode *Node, nodeManager *NodeManager) *P2PProtocol {
 	p2p := &P2PProtocol{
 		localNode:       localNode,
@@ -91,6 +98,7 @@ func NewP2PProtocol(localNode *Node, nodeManager *NodeManager) *P2PProtocol {
 	p2p.RegisterHandler(MessageTypePong, p2p.handlePong)
 	p2p.RegisterHandler(MessageTypeLatency, p2p.handleLatency)
 	p2p.RegisterHandler(MessageTypeRouteUpdate, p2p.handleRouteUpdate)
+	p2p.RegisterHandler(MessageTypeKeyExchange, p2p.handleKeyExchange)
 
 	return p2p
 }
@@ -392,6 +400,41 @@ func (p *P2PProtocol) handleLatency(msg *Message, conn *P2PConnection) error {
 func (p *P2PProtocol) handleRouteUpdate(msg *Message, conn *P2PConnection) error {
 	// Process route updates from peer
 	return nil
+}
+
+func (p *P2PProtocol) handleKeyExchange(msg *Message, conn *P2PConnection) error {
+	// Process key exchange from peer
+	keyData := msg.Data.(map[string]interface{})
+	
+	nodeID := keyData["node_id"].(string)
+	endpoint := keyData["endpoint"].(string)
+	
+	fmt.Printf("Received key exchange from %s: %s\n", nodeID, endpoint)
+	
+	// Here you would integrate with tunnel manager to set up WireGuard peer
+	// tm.HandleKeyExchange(nodeID, publicKeyBytes, endpoint)
+	
+	return nil
+}
+
+func (p *P2PProtocol) SendKeyExchange(nodeID, publicKey, endpoint string) error {
+	keyData := KeyExchangeData{
+		PublicKey: publicKey,
+		Endpoint:  endpoint,
+		NodeID:    p.localNode.ID,
+	}
+	
+	return p.SendMessage(nodeID, MessageTypeKeyExchange, keyData)
+}
+
+func (p *P2PProtocol) BroadcastKeyExchange(publicKey, endpoint string) {
+	keyData := KeyExchangeData{
+		PublicKey: publicKey,
+		Endpoint:  endpoint,
+		NodeID:    p.localNode.ID,
+	}
+	
+	p.BroadcastMessage(MessageTypeKeyExchange, keyData)
 }
 
 func generateMessageID() string {

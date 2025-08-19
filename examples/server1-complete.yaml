@@ -1,0 +1,61 @@
+# 服务器1完整配置文件
+# 假设：北京服务器，公网IP: 123.123.123.1
+
+server:
+  host: "0.0.0.0"          # 监听所有网卡，允许外部连接
+  port: 8080               # HTTP管理端口
+
+network:
+  name: "lorbol-testnet"   # 网络名称 - 所有节点必须相同
+  cidr: "10.100.0.0/16"   # 虚拟网络段 - 所有节点必须相同
+  gateway: "10.100.0.1"   # 网关IP - 所有节点必须相同
+  dns_servers:            # DNS服务器 - 所有节点可以相同
+    - "8.8.8.8"
+    - "1.1.1.1"
+    - "223.5.5.5"         # 可以添加国内DNS
+  domain: "lorbol.local"  # 域名后缀 - 所有节点必须相同
+  mtu: 1420              # MTU大小 - 所有节点建议相同
+
+node:
+  name: "beijing-server"  # 节点名称 - 每台服务器唯一
+  virtual_ip: "10.100.0.2" # 虚拟IP - 每台服务器唯一
+  public_ip: ""           # 留空自动检测，或填写实际公网IP: "123.123.123.1"
+  private_ip: ""          # 留空自动检测，或填写内网IP
+  port: 51820             # P2P通信端口 - 可以每台不同，但要在防火墙开放
+  auto_detect_ip: true    # 自动检测IP
+
+latency:
+  method: "tcp"           # 推荐TCP，云服务器ICMP可能被限制
+  interval: 15s           # 测量间隔 - 可以相同
+  timeout: 3s             # 超时时间 - 可以相同
+  sample_size: 3          # 采样次数 - 可以相同
+  target_endpoints:       # 静态测试目标 - 可以相同或不同
+    - "8.8.8.8"
+    - "1.1.1.1"
+    - "223.5.5.5"
+    # 可以添加其他服务器的公网IP进行测试
+
+routing:
+  algorithm: "dijkstra"   # 路由算法 - 所有节点必须相同
+  optimize_interval: 2m   # 优化间隔 - 可以相同
+  latency_threshold: 50ms # 延迟阈值 - 可以相同
+  max_retries: 3          # 重试次数 - 可以相同
+
+vpn:
+  interface: "lorbol0"    # 虚拟网卡名 - 所有节点建议相同
+  local_ip: "10.100.0.2"  # 本地虚拟IP - 必须与node.virtual_ip相同
+  remote_ips: []          # 远程IP列表 - 自动管理，保持空
+  port: 51820             # VPN端口 - 建议与node.port相同
+  protocol: "udp"         # 协议 - 所有节点必须相同
+  encryption: "chacha20poly1305" # 加密方式 - 所有节点必须相同
+
+monitor:
+  enabled: true           # 启用监控
+  metrics_port: 9090      # 监控端口 - 可以每台不同
+  update_interval: 10s    # 更新间隔 - 可以相同
+
+storage:
+  type: "file"            # 存储类型
+  path: "/var/lib/lorbol/data" # 存储路径 - 每台可以相同
+  max_size: 104857600     # 最大存储 100MB
+  retention: 168h         # 保留时间 7天

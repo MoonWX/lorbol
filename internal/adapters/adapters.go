@@ -4,6 +4,7 @@ import (
 	"github.com/MoonWX/lorbol/internal/latency"
 	"github.com/MoonWX/lorbol/internal/network"
 	"github.com/MoonWX/lorbol/internal/routing"
+	"github.com/MoonWX/lorbol/internal/tunnel"
 )
 
 // LatencyNodeManagerAdapter adapts network.NodeManager to latency.NodeManager
@@ -110,4 +111,83 @@ func (a *RoutingNodeManagerAdapter) GetOnlinePeers() []*routing.NetworkNode {
 	}
 	
 	return routingNodes
+}
+
+// TunnelNodeManagerAdapter adapts network.NodeManager to tunnel.NodeManager
+type TunnelNodeManagerAdapter struct {
+	nodeManager *network.NodeManager
+}
+
+func NewTunnelNodeManagerAdapter(nm *network.NodeManager) tunnel.NodeManager {
+	return &TunnelNodeManagerAdapter{nodeManager: nm}
+}
+
+func (a *TunnelNodeManagerAdapter) GetAllNodes() []*tunnel.Node {
+	networkNodes := a.nodeManager.GetAllNodes()
+	tunnelNodes := make([]*tunnel.Node, len(networkNodes))
+	
+	for i, nn := range networkNodes {
+		var publicKeyBytes []byte
+		if pubKey, exists := nn.Metadata["wireguard_public_key"]; exists {
+			publicKeyBytes = []byte(pubKey)
+		}
+		
+		tunnelNodes[i] = &tunnel.Node{
+			ID:        nn.ID,
+			Name:      nn.Name,
+			VirtualIP: nn.VirtualIP,
+			PublicIP:  nn.PublicIP,
+			Port:      nn.Port,
+			IsOnline:  nn.IsOnline,
+			PublicKey: publicKeyBytes,
+		}
+	}
+	
+	return tunnelNodes
+}
+
+func (a *TunnelNodeManagerAdapter) GetLocalNode() *tunnel.Node {
+	localNode := a.nodeManager.GetLocalNode()
+	if localNode == nil {
+		return nil
+	}
+	
+	var publicKeyBytes []byte
+	if pubKey, exists := localNode.Metadata["wireguard_public_key"]; exists {
+		publicKeyBytes = []byte(pubKey)
+	}
+	
+	return &tunnel.Node{
+		ID:        localNode.ID,
+		Name:      localNode.Name,
+		VirtualIP: localNode.VirtualIP,
+		PublicIP:  localNode.PublicIP,
+		Port:      localNode.Port,
+		IsOnline:  localNode.IsOnline,
+		PublicKey: publicKeyBytes,
+	}
+}
+
+func (a *TunnelNodeManagerAdapter) GetOnlinePeers() []*tunnel.Node {
+	networkNodes := a.nodeManager.GetOnlinePeers()
+	tunnelNodes := make([]*tunnel.Node, len(networkNodes))
+	
+	for i, nn := range networkNodes {
+		var publicKeyBytes []byte
+		if pubKey, exists := nn.Metadata["wireguard_public_key"]; exists {
+			publicKeyBytes = []byte(pubKey)
+		}
+		
+		tunnelNodes[i] = &tunnel.Node{
+			ID:        nn.ID,
+			Name:      nn.Name,
+			VirtualIP: nn.VirtualIP,
+			PublicIP:  nn.PublicIP,
+			Port:      nn.Port,
+			IsOnline:  nn.IsOnline,
+			PublicKey: publicKeyBytes,
+		}
+	}
+	
+	return tunnelNodes
 }

@@ -15,7 +15,7 @@ import (
 	"github.com/MoonWX/lorbol/internal/latency"
 	"github.com/MoonWX/lorbol/internal/network"
 	"github.com/MoonWX/lorbol/internal/routing"
-	"github.com/MoonWX/lorbol/internal/vpn"
+	"github.com/MoonWX/lorbol/internal/tunnel"
 )
 
 func main() {
@@ -52,7 +52,13 @@ func main() {
 	// Create services with network awareness
 	measurer := latency.NewNetworkMeasurer(cfg.Latency, latencyAdapter)
 	optimizer := routing.NewNetworkOptimizer(cfg.Routing, routingAdapter)
-	tunnel := vpn.NewTunnel(cfg.VPN)
+	
+	// Create tunnel manager (WireGuard-based VPN)
+	tunnelAdapter := adapters.NewTunnelNodeManagerAdapter(nodeManager)
+	tunnelManager, err := tunnel.NewTunnelManager(cfg.VPN, tunnelAdapter)
+	if err != nil {
+		log.Fatalf("failed to create tunnel manager: %v", err)
+	}
 	
 	// Create discovery service
 	discovery := network.NewDiscoveryService(localNode, nodeManager)
@@ -61,15 +67,15 @@ func main() {
 	p2p := network.NewP2PProtocol(localNode, nodeManager)
 
 	server := &Server{
-		config:      cfg,
-		virtualNet:  virtualNet,
-		localNode:   localNode,
-		nodeManager: nodeManager,
-		measurer:    measurer,
-		optimizer:   optimizer,
-		tunnel:      tunnel,
-		discovery:   discovery,
-		p2p:         p2p,
+		config:        cfg,
+		virtualNet:    virtualNet,
+		localNode:     localNode,
+		nodeManager:   nodeManager,
+		measurer:      measurer,
+		optimizer:     optimizer,
+		tunnelManager: tunnelManager,
+		discovery:     discovery,
+		p2p:           p2p,
 	}
 
 	go func() {
@@ -89,15 +95,15 @@ func main() {
 }
 
 type Server struct {
-	config      *config.Config
-	virtualNet  *network.VirtualNetwork
-	localNode   *network.Node
-	nodeManager *network.NodeManager
-	measurer    latency.Measurer
-	optimizer   routing.Optimizer
-	tunnel      vpn.Tunnel
-	discovery   *network.DiscoveryService
-	p2p         *network.P2PProtocol
+	config        *config.Config
+	virtualNet    *network.VirtualNetwork
+	localNode     *network.Node
+	nodeManager   *network.NodeManager
+	measurer      latency.Measurer
+	optimizer     routing.Optimizer
+	tunnelManager *tunnel.TunnelManager
+	discovery     *network.DiscoveryService
+	p2p           *network.P2PProtocol
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -124,6 +130,10 @@ func (s *Server) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start route optimizer: %w", err)
 	}
 	
+	if err := s.tunnelManager.Start(ctx); err != nil {
+		return fmt.Errorf("failed to start tunnel manager: %w", err)
+	}
+	
 	log.Printf("LORBOL server started successfully")
 	log.Printf("Local node: %s (%s)", s.localNode.VirtualIP, s.localNode.Name)
 	log.Printf("Network: %s", s.virtualNet.CIDR)
@@ -133,6 +143,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 func (s *Server) Stop() error {
 	log.Println("stopping LORBOL server...")
+	
+	if err := s.tunnelManager.Stop(); err != nil {
+		log.Printf("error stopping tunnel manager: %v", err)
+	}
 	
 	if err := s.optimizer.Stop(); err != nil {
 		log.Printf("error stopping optimizer: %v", err)
