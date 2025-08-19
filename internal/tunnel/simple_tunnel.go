@@ -16,12 +16,13 @@ import (
 
 // SimpleTunnel implements a basic encrypted UDP tunnel without WireGuard dependency
 type SimpleTunnel struct {
-	localIP    net.IP
-	listenPort int
-	conn       *net.UDPConn
-	peers      map[string]*TunnelPeer
-	mu         sync.RWMutex
-	cipher     []byte // 32-byte key for ChaCha20Poly1305
+	localIP        net.IP
+	listenPort     int
+	conn           *net.UDPConn
+	peers          map[string]*TunnelPeer
+	mu             sync.RWMutex
+	cipher         []byte // 32-byte key for ChaCha20Poly1305
+	onDataReceived func([]byte) // Callback for received data
 }
 
 type TunnelPeer struct {
@@ -59,6 +60,10 @@ func NewSimpleTunnel(localIP net.IP, listenPort int) (*SimpleTunnel, error) {
 		peers:      make(map[string]*TunnelPeer),
 		cipher:     key,
 	}, nil
+}
+
+func (st *SimpleTunnel) SetDataReceivedCallback(callback func([]byte)) {
+	st.onDataReceived = callback
 }
 
 func (st *SimpleTunnel) Start() error {
@@ -208,12 +213,17 @@ func (st *SimpleTunnel) handleHandshake(addr *net.UDPAddr, nonce []byte, payload
 	// Verify handshake - for now, accept any handshake from known peers
 	fmt.Printf("SimpleTunnel: Activating peer %s (from handshake: %s)\n", peer.ID, handshake.NodeID)
 	st.mu.Lock()
+	wasActive := peer.IsActive
 	peer.IsActive = true
 	peer.LastSeen = time.Now()
 	st.mu.Unlock()
 
-	// Send handshake response
-	st.sendHandshake(peer)
+	// Only send handshake response if peer wasn't already active
+	// This prevents handshake loops
+	if !wasActive {
+		fmt.Printf("SimpleTunnel: Sending handshake response to newly activated peer %s\n", peer.ID)
+		st.sendHandshake(peer)
+	}
 }
 
 func (st *SimpleTunnel) handleDataPacket(addr *net.UDPAddr, nonce []byte, payload []byte) {
@@ -244,8 +254,13 @@ func (st *SimpleTunnel) handleDataPacket(addr *net.UDPAddr, nonce []byte, payloa
 	st.mu.Unlock()
 
 	// Forward decrypted data to TUN interface
-	// This would be handled by the TUN interface manager
-	_ = decrypted
+	fmt.Printf("SimpleTunnel: Received %d bytes of data from peer %s\n", len(decrypted), peer.ID)
+	
+	// We need a way to forward this to the TUN interface
+	// For now, we'll need to implement a callback mechanism
+	if st.onDataReceived != nil {
+		st.onDataReceived(decrypted)
+	}
 }
 
 func (st *SimpleTunnel) handleKeepalive(addr *net.UDPAddr) {

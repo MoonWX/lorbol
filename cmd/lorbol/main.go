@@ -105,6 +105,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create tunnel: %w", err)
 	}
+	
+	// Set callback to forward tunnel data to TUN interface
+	simpleTunnel.SetDataReceivedCallback(func(data []byte) {
+		if tunIface != nil {
+			log.Printf("Forwarding %d bytes from tunnel to TUN interface", len(data))
+			if err := tunIface.WritePacket(data); err != nil {
+				log.Printf("Failed to write packet to TUN: %v", err)
+			}
+		}
+	})
 
 	// Create bootstrap discovery service
 	var bootstrapURLs []string
@@ -255,11 +265,23 @@ func (s *Server) processPeers() {
 			}
 			
 			if virtualIP != nil {
-				log.Printf("Adding peer to tunnel: %s -> %s (virtual: %s)", peer.Name, endpoint, virtualIP.String())
-				if err := s.tunnel.AddPeer(peer.ID, endpoint, virtualIP); err != nil {
-					log.Printf("failed to add peer %s: %v", peer.Name, err)
-				} else {
-					log.Printf("successfully added peer: %s (%s)", peer.Name, virtualIP.String())
+				// Check if peer is already added and active
+				activePeers := s.tunnel.GetActivePeers()
+				peerExists := false
+				for _, activePeer := range activePeers {
+					if activePeer.VirtualIP.Equal(virtualIP) {
+						peerExists = true
+						break
+					}
+				}
+				
+				if !peerExists {
+					log.Printf("Adding peer to tunnel: %s -> %s (virtual: %s)", peer.Name, endpoint, virtualIP.String())
+					if err := s.tunnel.AddPeer(peer.ID, endpoint, virtualIP); err != nil {
+						log.Printf("failed to add peer %s: %v", peer.Name, err)
+					} else {
+						log.Printf("successfully added peer: %s (%s)", peer.Name, virtualIP.String())
+					}
 				}
 			} else {
 				log.Printf("Cannot determine virtual IP for peer %s", peer.Name)
