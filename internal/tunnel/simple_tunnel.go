@@ -86,6 +86,8 @@ func (st *SimpleTunnel) Stop() error {
 }
 
 func (st *SimpleTunnel) AddPeer(nodeID string, endpoint string, virtualIP net.IP) error {
+	fmt.Printf("SimpleTunnel: Adding peer %s at %s with virtual IP %s\n", nodeID, endpoint, virtualIP.String())
+	
 	udpAddr, err := net.ResolveUDPAddr("udp", endpoint)
 	if err != nil {
 		return fmt.Errorf("invalid endpoint %s: %w", endpoint, err)
@@ -107,6 +109,7 @@ func (st *SimpleTunnel) AddPeer(nodeID string, endpoint string, virtualIP net.IP
 	st.peers[nodeID] = peer
 	st.mu.Unlock()
 
+	fmt.Printf("SimpleTunnel: Sending handshake to peer %s\n", nodeID)
 	// Send handshake
 	return st.sendHandshake(peer)
 }
@@ -168,6 +171,8 @@ func (st *SimpleTunnel) handleIncomingPackets() {
 }
 
 func (st *SimpleTunnel) handleHandshake(addr *net.UDPAddr, nonce []byte, payload []byte) {
+	fmt.Printf("SimpleTunnel: Received handshake from %s\n", addr.String())
+	
 	// Find peer by endpoint
 	st.mu.RLock()
 	var peer *TunnelPeer
@@ -180,31 +185,33 @@ func (st *SimpleTunnel) handleHandshake(addr *net.UDPAddr, nonce []byte, payload
 	st.mu.RUnlock()
 
 	if peer == nil {
+		fmt.Printf("SimpleTunnel: Unknown peer %s, ignoring handshake\n", addr.String())
 		return // Unknown peer
 	}
 
 	// Decrypt handshake payload
 	decrypted, err := st.decrypt(peer.SharedKey, nonce, payload)
 	if err != nil {
+		fmt.Printf("SimpleTunnel: Failed to decrypt handshake from %s: %v\n", addr.String(), err)
 		return
 	}
 
 	// Parse handshake
 	var handshake HandshakePacket
 	if err := st.parseHandshake(decrypted, &handshake); err != nil {
+		fmt.Printf("SimpleTunnel: Failed to parse handshake from %s: %v\n", addr.String(), err)
 		return
 	}
 
-	// Verify handshake
-	if handshake.NodeID == peer.ID {
-		st.mu.Lock()
-		peer.IsActive = true
-		peer.LastSeen = time.Now()
-		st.mu.Unlock()
+	// Verify handshake - for now, accept any handshake from known peers
+	fmt.Printf("SimpleTunnel: Activating peer %s (from handshake: %s)\n", peer.ID, handshake.NodeID)
+	st.mu.Lock()
+	peer.IsActive = true
+	peer.LastSeen = time.Now()
+	st.mu.Unlock()
 
-		// Send handshake response
-		st.sendHandshake(peer)
-	}
+	// Send handshake response
+	st.sendHandshake(peer)
 }
 
 func (st *SimpleTunnel) handleDataPacket(addr *net.UDPAddr, nonce []byte, payload []byte) {

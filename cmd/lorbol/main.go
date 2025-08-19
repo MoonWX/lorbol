@@ -210,6 +210,9 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) managePeers(ctx context.Context) {
+	// Initial peer management
+	s.processPeers()
+	
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -218,40 +221,74 @@ func (s *Server) managePeers(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Get discovered peers
-			peers := s.discovery.GetKnownPeers()
-			
-			// Add new peers to tunnel
-			for _, peer := range peers {
-				if peer.ID != s.localNode.ID && peer.PublicIP != "" {
-					endpoint := fmt.Sprintf("%s:%d", peer.PublicIP, peer.Port)
-					virtualIP := net.ParseIP(peer.VirtualIP)
-					if virtualIP != nil {
-						if err := s.tunnel.AddPeer(peer.ID, endpoint, virtualIP); err != nil {
-							log.Printf("failed to add peer %s: %v", peer.Name, err)
-						} else {
-							log.Printf("added peer: %s (%s)", peer.Name, peer.VirtualIP)
-						}
-					}
-				}
-			}
+			s.processPeers()
+		}
+	}
+}
 
-			// Measure latencies to active peers
-			activePeers := s.tunnel.GetActivePeers()
-			for _, peer := range activePeers {
-				latency, err := s.measurer.MeasureLatency(peer.VirtualIP, peer.Endpoint.String())
-				if err != nil {
-					log.Printf("failed to measure latency to %s: %v", peer.VirtualIP, err)
-				} else {
-					log.Printf("latency to %s: %v", peer.VirtualIP, latency)
+func (s *Server) processPeers() {
+	// Get discovered peers
+	peers := s.discovery.GetKnownPeers()
+	log.Printf("Processing %d discovered peers", len(peers))
+	
+	// Add new peers to tunnel
+	for _, peer := range peers {
+		log.Printf("Checking peer: %s (ID:%s, PublicIP:%s, VirtualIP:%s)", peer.Name, peer.ID, peer.PublicIP, peer.VirtualIP)
+		
+		if peer.ID != s.localNode.ID && peer.PublicIP != "" {
+			endpoint := fmt.Sprintf("%s:%d", peer.PublicIP, peer.Port)
+			
+			// For static peers, we need to set their virtual IP from our knowledge
+			// Since static discovery doesn't know their virtual IP initially
+			var virtualIP net.IP
+			if peer.VirtualIP != "" {
+				virtualIP = net.ParseIP(peer.VirtualIP)
+			} else {
+				// Assign virtual IP based on the peer
+				// This is a temporary solution - in real implementation,
+				// virtual IPs should be exchanged during handshake
+				if peer.PublicIP == "47.245.15.86" {
+					virtualIP = net.ParseIP("10.100.0.3")
+				} else if peer.PublicIP == "8.211.175.127" {
+					virtualIP = net.ParseIP("10.100.0.2")
 				}
 			}
+			
+			if virtualIP != nil {
+				log.Printf("Adding peer to tunnel: %s -> %s (virtual: %s)", peer.Name, endpoint, virtualIP.String())
+				if err := s.tunnel.AddPeer(peer.ID, endpoint, virtualIP); err != nil {
+					log.Printf("failed to add peer %s: %v", peer.Name, err)
+				} else {
+					log.Printf("successfully added peer: %s (%s)", peer.Name, virtualIP.String())
+				}
+			} else {
+				log.Printf("Cannot determine virtual IP for peer %s", peer.Name)
+			}
+		}
+	}
+
+	// Measure latencies to active peers
+	activePeers := s.tunnel.GetActivePeers()
+	log.Printf("Found %d active tunnel peers", len(activePeers))
+	for _, peer := range activePeers {
+		latency, err := s.measurer.MeasureLatency(peer.VirtualIP, peer.Endpoint.String())
+		if err != nil {
+			log.Printf("failed to measure latency to %s: %v", peer.VirtualIP, err)
+		} else {
+			log.Printf("latency to %s: %v", peer.VirtualIP, latency)
 		}
 	}
 }
 
 func (s *Server) forwardPackets(ctx context.Context) {
 	buffer := make([]byte, 1500)
+	
+	// Parse network CIDR for filtering
+	_, virtualNet, err := net.ParseCIDR(s.config.Network.CIDR)
+	if err != nil {
+		log.Printf("Invalid network CIDR: %v", err)
+		return
+	}
 	
 	for {
 		select {
@@ -270,6 +307,19 @@ func (s *Server) forwardPackets(ctx context.Context) {
 			}
 
 			dstIP := net.IPv4(packet[16], packet[17], packet[18], packet[19])
+			
+			// Only forward packets destined for our virtual network
+			if !virtualNet.Contains(dstIP) {
+				log.Printf("Ignoring packet to %s (outside virtual network %s)", dstIP, s.config.Network.CIDR)
+				continue
+			}
+			
+			// Don't forward packets to ourselves
+			if dstIP.Equal(net.ParseIP(s.localNode.VirtualIP)) {
+				continue
+			}
+			
+			log.Printf("Forwarding packet to %s through tunnel", dstIP)
 			
 			// Forward packet through tunnel
 			if err := s.tunnel.SendData(dstIP, packet); err != nil {
