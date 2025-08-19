@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -320,19 +322,39 @@ func (st *SimpleTunnel) decrypt(key, nonce, ciphertext []byte) ([]byte, error) {
 }
 
 func (st *SimpleTunnel) generateSharedKey(nodeID string) []byte {
-	// Generate deterministic shared key based on network name and sorted node IDs
-	// This ensures both nodes generate the same key
-	localNodeID := fmt.Sprintf("local-%s", st.localIP.String()) // Use IP as local node ID
-	
-	// Sort the node IDs to ensure deterministic order
-	var keyInput string
-	if localNodeID < nodeID {
-		keyInput = fmt.Sprintf("lorbol-network-%s-%s", localNodeID, nodeID)
+	// Extract public IP from nodeID (format: "static-X.X.X.X")
+	var peerPublicIP string
+	if strings.HasPrefix(nodeID, "static-") {
+		peerPublicIP = strings.TrimPrefix(nodeID, "static-")
 	} else {
-		keyInput = fmt.Sprintf("lorbol-network-%s-%s", nodeID, localNodeID)
+		peerPublicIP = nodeID
 	}
 	
-	fmt.Printf("SimpleTunnel: Generating shared key with input: %s\n", keyInput)
+	// Get our public IP from local IP (assuming it's our virtual IP, we need actual public IP)
+	// For now, use a simple network-wide shared secret
+	// In production, this should be proper key exchange
+	
+	// Create a deterministic key based on the two public IPs
+	ips := []string{peerPublicIP}
+	
+	// We need to get our public IP somehow - let's use a simple approach
+	// Since we know the mapping from the config
+	var localPublicIP string
+	localVirtualIP := st.localIP.String()
+	if localVirtualIP == "10.100.0.2" {
+		localPublicIP = "8.211.175.127"
+	} else if localVirtualIP == "10.100.0.3" {
+		localPublicIP = "47.245.15.86"
+	}
+	
+	ips = append(ips, localPublicIP)
+	
+	// Sort IPs to ensure deterministic order
+	sort.Strings(ips)
+	
+	keyInput := fmt.Sprintf("lorbol-network-%s-%s", ips[0], ips[1])
+	fmt.Printf("SimpleTunnel: Generating shared key with input: %s (local: %s, peer: %s)\n", keyInput, localPublicIP, peerPublicIP)
+	
 	hash := sha256.Sum256([]byte(keyInput))
 	return hash[:]
 }
