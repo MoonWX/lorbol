@@ -9,12 +9,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/MoonWX/lorbol/internal/adapters"
 	"github.com/MoonWX/lorbol/internal/config"
+	"github.com/MoonWX/lorbol/internal/discovery"
 	"github.com/MoonWX/lorbol/internal/latency"
-	"github.com/MoonWX/lorbol/internal/network"
 	"github.com/MoonWX/lorbol/internal/routing"
+	"github.com/MoonWX/lorbol/internal/tun"
 	"github.com/MoonWX/lorbol/internal/tunnel"
 )
 
@@ -27,56 +28,13 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
+	server, err := NewServer(cfg)
+	if err != nil {
+		log.Fatalf("failed to create server: %v", err)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	// Create virtual network
-	virtualNet, err := network.NewVirtualNetwork(cfg.Network.Name, cfg.Network.CIDR)
-	if err != nil {
-		log.Fatalf("failed to create virtual network: %v", err)
-	}
-
-	// Create local node
-	localNode, err := createLocalNode(cfg)
-	if err != nil {
-		log.Fatalf("failed to create local node: %v", err)
-	}
-
-	// Create node manager
-	nodeManager := network.NewNodeManager(localNode, virtualNet)
-
-	// Create adapters for interface compatibility
-	latencyAdapter := adapters.NewLatencyNodeManagerAdapter(nodeManager)
-	routingAdapter := adapters.NewRoutingNodeManagerAdapter(nodeManager)
-	
-	// Create services with network awareness
-	measurer := latency.NewNetworkMeasurer(cfg.Latency, latencyAdapter)
-	optimizer := routing.NewNetworkOptimizer(cfg.Routing, routingAdapter)
-	
-	// Create tunnel manager (WireGuard-based VPN)
-	tunnelAdapter := adapters.NewTunnelNodeManagerAdapter(nodeManager)
-	tunnelManager, err := tunnel.NewTunnelManager(cfg.VPN, tunnelAdapter)
-	if err != nil {
-		log.Fatalf("failed to create tunnel manager: %v", err)
-	}
-	
-	// Create discovery service
-	discovery := network.NewDiscoveryService(localNode, nodeManager)
-	
-	// Create P2P protocol
-	p2p := network.NewP2PProtocol(localNode, nodeManager)
-
-	server := &Server{
-		config:        cfg,
-		virtualNet:    virtualNet,
-		localNode:     localNode,
-		nodeManager:   nodeManager,
-		measurer:      measurer,
-		optimizer:     optimizer,
-		tunnelManager: tunnelManager,
-		discovery:     discovery,
-		p2p:           p2p,
-	}
 
 	go func() {
 		if err := server.Start(ctx); err != nil {
@@ -95,113 +53,212 @@ func main() {
 }
 
 type Server struct {
-	config        *config.Config
-	virtualNet    *network.VirtualNetwork
-	localNode     *network.Node
-	nodeManager   *network.NodeManager
-	measurer      latency.Measurer
-	optimizer     routing.Optimizer
-	tunnelManager *tunnel.TunnelManager
-	discovery     *network.DiscoveryService
-	p2p           *network.P2PProtocol
+	config      *config.Config
+	tunInterface *tun.Interface
+	tunnel      *tunnel.SimpleTunnel
+	discovery   *discovery.BootstrapService
+	measurer    *latency.UDPMeasurer
+	optimizer   *routing.ShortestPathOptimizer
+	localNode   *discovery.Node
+}
+
+func NewServer(cfg *config.Config) (*Server, error) {
+	// Parse virtual IP
+	virtualIP := net.ParseIP(cfg.Node.VirtualIP)
+	if virtualIP == nil {
+		return nil, fmt.Errorf("invalid virtual IP: %s", cfg.Node.VirtualIP)
+	}
+
+	// Create local node
+	localNode := &discovery.Node{
+		ID:        fmt.Sprintf("%s-%d", cfg.Node.Name, time.Now().Unix()),
+		Name:      cfg.Node.Name,
+		VirtualIP: virtualIP.String(),
+		PublicIP:  "", // Will be detected or set from config
+		Port:      cfg.Node.ListenPort,
+		Network:   cfg.Network.Name,
+		Timestamp: time.Now().Unix(),
+	}
+
+	// Auto-detect public IP if not specified
+	if cfg.Node.PublicIP == "" {
+		if detectedIP, err := detectPublicIP(); err == nil {
+			localNode.PublicIP = detectedIP
+		} else {
+			log.Printf("Warning: failed to detect public IP: %v", err)
+		}
+	} else {
+		localNode.PublicIP = cfg.Node.PublicIP
+	}
+
+	// Create TUN interface
+	tunIface, err := tun.NewInterface(cfg.TUN.InterfaceName, virtualIP, cfg.Network.CIDR, cfg.TUN.MTU)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create TUN interface: %w", err)
+	}
+
+	// Create simple tunnel
+	simpleTunnel, err := tunnel.NewSimpleTunnel(virtualIP, cfg.Node.ListenPort)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create tunnel: %w", err)
+	}
+
+	// Create bootstrap discovery service
+	var bootstrapURLs []string
+	if cfg.Bootstrap.Method == "static" {
+		// For static method, we'll handle peers directly
+		bootstrapURLs = []string{}
+	} else {
+		// For other methods, use default URLs for now
+		bootstrapURLs = []string{}
+	}
+	discoveryService := discovery.NewBootstrapService(localNode, bootstrapURLs)
+
+	// Create latency measurer
+	measurer := latency.NewUDPMeasurer(cfg.Latency.Interval, cfg.Latency.Timeout)
+
+	// Create routing optimizer
+	optimizer := routing.NewShortestPathOptimizer(cfg.Routing.OptimizeInterval)
+
+	return &Server{
+		config:       cfg,
+		tunInterface: tunIface,
+		tunnel:       simpleTunnel,
+		discovery:    discoveryService,
+		measurer:     measurer,
+		optimizer:    optimizer,
+		localNode:    localNode,
+	}, nil
 }
 
 func (s *Server) Start(ctx context.Context) error {
-	log.Printf("starting LORBOL server for node %s in network %s...", s.localNode.Name, s.virtualNet.Name)
-	
-	// Start all services
-	if err := s.nodeManager.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start node manager: %w", err)
+	log.Printf("starting LORBOL server for node %s...", s.localNode.Name)
+	log.Printf("Virtual IP: %s", s.localNode.VirtualIP)
+	log.Printf("Public IP: %s", s.localNode.PublicIP)
+	log.Printf("Listen Port: %d", s.localNode.Port)
+
+	// Start TUN interface
+	if err := s.tunInterface.Start(); err != nil {
+		return fmt.Errorf("failed to start TUN interface: %w", err)
 	}
-	
+
+	// Start tunnel
+	if err := s.tunnel.Start(); err != nil {
+		return fmt.Errorf("failed to start tunnel: %w", err)
+	}
+
+	// Start discovery service
 	if err := s.discovery.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start discovery service: %w", err)
 	}
-	
-	if err := s.p2p.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start P2P protocol: %w", err)
-	}
-	
-	if err := s.measurer.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start latency measurer: %w", err)
-	}
-	
-	if err := s.optimizer.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start route optimizer: %w", err)
-	}
-	
-	if err := s.tunnelManager.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start tunnel manager: %w", err)
-	}
-	
+
+	// Start peer management loop
+	go s.managePeers(ctx)
+
+	// Start packet forwarding
+	go s.forwardPackets(ctx)
+
 	log.Printf("LORBOL server started successfully")
-	log.Printf("Local node: %s (%s)", s.localNode.VirtualIP, s.localNode.Name)
-	log.Printf("Network: %s", s.virtualNet.CIDR)
-	
 	return nil
 }
 
 func (s *Server) Stop() error {
 	log.Println("stopping LORBOL server...")
-	
-	if err := s.tunnelManager.Stop(); err != nil {
-		log.Printf("error stopping tunnel manager: %v", err)
-	}
-	
-	if err := s.optimizer.Stop(); err != nil {
-		log.Printf("error stopping optimizer: %v", err)
-	}
-	
-	if err := s.measurer.Stop(); err != nil {
-		log.Printf("error stopping measurer: %v", err)
-	}
-	
-	if err := s.p2p.Stop(); err != nil {
-		log.Printf("error stopping P2P protocol: %v", err)
-	}
-	
+
 	if err := s.discovery.Stop(); err != nil {
 		log.Printf("error stopping discovery service: %v", err)
 	}
-	
-	if err := s.nodeManager.Stop(); err != nil {
-		log.Printf("error stopping node manager: %v", err)
+
+	if err := s.tunnel.Stop(); err != nil {
+		log.Printf("error stopping tunnel: %v", err)
 	}
-	
+
+	if err := s.tunInterface.Stop(); err != nil {
+		log.Printf("error stopping TUN interface: %v", err)
+	}
+
 	log.Println("LORBOL server stopped")
 	return nil
 }
 
-func createLocalNode(cfg *config.Config) (*network.Node, error) {
-	virtualIP := cfg.Node.VirtualIP
-	if virtualIP == "" {
-		return nil, fmt.Errorf("virtual IP is required")
-	}
-	
-	publicIP := cfg.Node.PublicIP
-	if publicIP == "" && cfg.Node.AutoDetectIP {
-		// Auto-detect public IP
-		if detectedIP, err := detectPublicIP(); err == nil {
-			publicIP = detectedIP
+func (s *Server) managePeers(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Get discovered peers
+			peers := s.discovery.GetKnownPeers()
+			
+			// Add new peers to tunnel
+			for _, peer := range peers {
+				if peer.ID != s.localNode.ID && peer.PublicIP != "" {
+					endpoint := fmt.Sprintf("%s:%d", peer.PublicIP, peer.Port)
+					virtualIP := net.ParseIP(peer.VirtualIP)
+					if virtualIP != nil {
+						if err := s.tunnel.AddPeer(peer.ID, endpoint, virtualIP); err != nil {
+							log.Printf("failed to add peer %s: %v", peer.Name, err)
+						} else {
+							log.Printf("added peer: %s (%s)", peer.Name, peer.VirtualIP)
+						}
+					}
+				}
+			}
+
+			// Measure latencies to active peers
+			activePeers := s.tunnel.GetActivePeers()
+			for _, peer := range activePeers {
+				latency, err := s.measurer.MeasureLatency(peer.VirtualIP, peer.Endpoint.String())
+				if err != nil {
+					log.Printf("failed to measure latency to %s: %v", peer.VirtualIP, err)
+				} else {
+					log.Printf("latency to %s: %v", peer.VirtualIP, latency)
+				}
+			}
 		}
 	}
+}
+
+func (s *Server) forwardPackets(ctx context.Context) {
+	buffer := make([]byte, 1500)
 	
-	if publicIP == "" {
-		return nil, fmt.Errorf("public IP is required and auto-detection failed")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			// Read packet from TUN interface
+			packet, err := s.tunInterface.ReadPacket(buffer)
+			if err != nil {
+				continue
+			}
+
+			// Parse destination IP from packet
+			if len(packet) < 20 { // Minimum IPv4 header size
+				continue
+			}
+
+			dstIP := net.IPv4(packet[16], packet[17], packet[18], packet[19])
+			
+			// Forward packet through tunnel
+			if err := s.tunnel.SendData(dstIP, packet); err != nil {
+				log.Printf("failed to send packet to %s: %v", dstIP, err)
+			}
+		}
 	}
-	
-	return network.NewNode(cfg.Node.Name, virtualIP, publicIP, cfg.Node.Port)
 }
 
 func detectPublicIP() (string, error) {
-	// Simple implementation: use local IP for now
-	// In production, you'd want to use STUN or similar
+	// Try to detect public IP by connecting to a remote server
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
-	
+
 	localAddr := conn.LocalAddr().(*net.UDPAddr)
 	return localAddr.IP.String(), nil
 }

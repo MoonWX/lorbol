@@ -1,0 +1,36 @@
+# LORBOL GitHub Bootstrap 配置示例
+# 使用GitHub作为免费的节点发现服务
+
+network:
+  name: "github-mesh"
+  cidr: "10.200.0.0/16"
+
+node:
+  name: "my-node"
+  virtual_ip: "10.200.0.10"
+  listen_port: 51820
+
+# 使用GitHub仓库进行节点发现
+bootstrap:
+  method: "github"
+  config:
+    github_repo: "username/lorbol-nodes"     # 你的GitHub仓库
+    github_file: "nodes.json"               # 节点信息文件
+    github_token: "ghp_xxxxxxxxxxxx"        # GitHub Personal Access Token (可选)
+    update_interval: 60s                    # 更新间隔
+
+tun:
+  interface_name: "lorbol0"
+  mtu: 1420
+
+latency:
+  method: "udp"
+  interval: 30s
+  timeout: 5s
+
+routing:
+  optimize_interval: 60s
+  algorithm: "shortest_path"
+
+logging:
+  level: "info"

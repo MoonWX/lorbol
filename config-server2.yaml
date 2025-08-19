@@ -1,0 +1,42 @@
+# LORBOL 服务器2配置文件
+# 适用于新设计：无需WireGuard，自动UDP隧道
+
+# 网络配置（所有节点必须相同）
+network:
+  name: "test-network"          # 网络名称 - 必须与其他节点相同
+  cidr: "10.100.0.0/16"        # 虚拟网络段 - 必须与其他节点相同
+
+# 节点配置（每个节点必须不同）
+node:
+  name: "server-2"              # 节点名称 - 必须与其他节点不同
+  virtual_ip: "10.100.0.3"     # 虚拟IP地址 - 必须与其他节点不同
+  listen_port: 51820           # UDP监听端口
+
+# 节点发现配置
+bootstrap:
+  method: "static"              # 使用静态配置发现节点
+  config:
+    static_peers:              # 其他节点的公网地址
+      - "服务器1的公网IP:51820"   # 替换为实际IP
+      # - "1.2.3.4:51820"      # 可以添加更多节点
+
+# TUN接口配置  
+tun:
+  interface_name: "lorbol0"     # TUN接口名称
+  mtu: 1420                    # MTU大小
+
+# 延迟测量配置
+latency:
+  method: "udp"                # 使用UDP测量延迟
+  interval: 15s                # 测量间隔
+  timeout: 3s                  # 超时时间
+
+# 路由优化配置
+routing:
+  optimize_interval: 30s       # 路由优化间隔
+  algorithm: "shortest_path"   # 使用最短路径算法
+
+# 日志配置
+logging:
+  level: "info"                # 日志级别: debug, info, warn, error
+  file: "/var/log/lorbol.log"  # 日志文件路径（可选）
