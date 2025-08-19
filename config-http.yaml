@@ -1,0 +1,43 @@
+# LORBOL HTTP发现配置文件
+# 使用HTTP发现服务器进行节点发现
+
+# 网络配置（所有节点必须相同）
+network:
+  name: "http-network"           # 网络名称
+  cidr: "10.100.0.0/16"         # 虚拟网络段
+
+# 节点配置（每个节点必须不同）
+node:
+  name: "node-1"                # 节点名称 - 修改为不同值
+  virtual_ip: "10.100.0.10"     # 虚拟IP地址 - 修改为不同值
+  listen_port: 51820            # UDP监听端口
+
+# HTTP发现配置
+bootstrap:
+  method: "http"                # 使用HTTP发现
+  config:
+    discovery_urls:             # HTTP发现服务器地址列表
+      - "http://your-server.com:8080/discover"
+      - "http://backup-server.com:8080/discover"
+    register_interval: 60s      # 注册间隔
+    discover_interval: 30s      # 发现间隔
+
+# TUN接口配置  
+tun:
+  interface_name: "lorbol0"
+  mtu: 1420
+
+# 延迟测量配置
+latency:
+  method: "udp"
+  interval: 30s
+  timeout: 5s
+
+# 路由优化配置
+routing:
+  optimize_interval: 60s
+  algorithm: "shortest_path"
+
+# 日志配置
+logging:
+  level: "info"

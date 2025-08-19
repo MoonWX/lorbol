@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -123,6 +124,8 @@ func (bs *BootstrapService) discoveryLoop(ctx context.Context) {
 func (bs *BootstrapService) performDiscovery() {
 	// Try multiple discovery methods
 	bs.discoverViaBootstrapServers()
+	bs.discoverViaGitHub()
+	bs.discoverViaDNS()
 	bs.discoverViaDirectConnect()
 }
 
@@ -149,13 +152,12 @@ func (bs *BootstrapService) discoverViaBootstrapServers() {
 }
 
 func (bs *BootstrapService) queryBootstrapServer(url string) ([]*Node, error) {
-	// This is a simplified implementation
-	// In reality, you'd implement different strategies:
-	// 1. HTTP API to a central registry
-	// 2. GitHub-based peer registry
-	// 3. DNS TXT records
-	// 4. DHT-based discovery
-
+	// Try HTTP discovery server
+	if strings.Contains(url, "/discover") {
+		return bs.queryHTTPDiscoveryServer(url)
+	}
+	
+	// Fallback to generic bootstrap request
 	req := &BootstrapRequest{
 		Action: "discover",
 		Node:   bs.localNode,
@@ -168,6 +170,60 @@ func (bs *BootstrapService) queryBootstrapServer(url string) ([]*Node, error) {
 	
 	// For now, return empty list
 	return []*Node{}, nil
+}
+
+func (bs *BootstrapService) queryHTTPDiscoveryServer(baseURL string) ([]*Node, error) {
+	// Register ourselves first
+	if err := bs.registerToHTTPServer(baseURL); err != nil {
+		fmt.Printf("HTTP Discovery: Failed to register: %v\n", err)
+	}
+
+	// Query for other nodes
+	discoverURL := fmt.Sprintf("%s?network=%s", baseURL, bs.localNode.Network)
+	
+	resp, err := bs.httpClient.Get(discoverURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Nodes []*Node `json:"nodes"`
+		Count int     `json:"count"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("HTTP Discovery: Found %d nodes in network %s\n", result.Count, bs.localNode.Network)
+	return result.Nodes, nil
+}
+
+func (bs *BootstrapService) registerToHTTPServer(baseURL string) error {
+	registerURL := strings.Replace(baseURL, "/discover", "/register", 1)
+	
+	reqBody, err := json.Marshal(bs.localNode)
+	if err != nil {
+		return err
+	}
+
+	resp, err := bs.httpClient.Post(registerURL, "application/json", strings.NewReader(string(reqBody)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	fmt.Printf("HTTP Discovery: Registered node %s to %s\n", bs.localNode.Name, registerURL)
+	return nil
 }
 
 func (bs *BootstrapService) discoverViaDirectConnect() {
@@ -225,16 +281,33 @@ func (bs *BootstrapService) AddKnownPeer(node *Node) {
 	}
 }
 
-// GitHub-based bootstrap implementation
+// GitHub-based discovery implementation
+func (bs *BootstrapService) discoverViaGitHub() {
+	// First register ourselves
+	bs.registerToGitHub()
+	
+	// Then discover other nodes
+	bs.queryGitHubNodes()
+}
+
 func (bs *BootstrapService) registerToGitHub() error {
-	// This would implement registration to a GitHub-based registry
-	// where each node posts its info as a JSON file
+	// TODO: Implement GitHub-based node registration
+	// This would use GitHub API to create/update a file with node info
+	fmt.Printf("GitHub Discovery: Would register node %s (IP: %s)\n", bs.localNode.Name, bs.localNode.PublicIP)
 	return nil
+}
+
+func (bs *BootstrapService) queryGitHubNodes() []*Node {
+	// TODO: Implement GitHub-based node discovery  
+	// This would query a GitHub repository for nodes.json file
+	fmt.Printf("GitHub Discovery: Would query for nodes in network %s\n", bs.localNode.Network)
+	return []*Node{}
 }
 
 // DNS-based discovery
 func (bs *BootstrapService) discoverViaDNS() []*Node {
 	// This would implement DNS TXT record discovery
 	// e.g., _lorbol._udp.example.com TXT "node=id:abc,ip:1.2.3.4,port:51820"
+	fmt.Printf("DNS Discovery: Would query _lorbol._udp.%s for TXT records\n", bs.localNode.Network)
 	return []*Node{}
 }

@@ -120,7 +120,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	var bootstrapURLs []string
 	discoveryService := discovery.NewBootstrapService(localNode, bootstrapURLs)
 	
-	// Handle static peer configuration
+	// Handle discovery configuration based on method
 	if cfg.Bootstrap.Method == "static" {
 		if staticPeersInterface, exists := cfg.Bootstrap.Config["static_peers"]; exists {
 			if staticPeers, ok := staticPeersInterface.([]interface{}); ok {
@@ -150,6 +150,20 @@ func NewServer(cfg *config.Config) (*Server, error) {
 				}
 			}
 		}
+	} else if cfg.Bootstrap.Method == "http" {
+		// Handle HTTP discovery configuration
+		if discoveryURLsInterface, exists := cfg.Bootstrap.Config["discovery_urls"]; exists {
+			if discoveryURLs, ok := discoveryURLsInterface.([]interface{}); ok {
+				for _, urlInterface := range discoveryURLs {
+					if urlStr, ok := urlInterface.(string); ok {
+						bootstrapURLs = append(bootstrapURLs, urlStr)
+						log.Printf("Added HTTP discovery server: %s", urlStr)
+					}
+				}
+			}
+		}
+		// Update the discovery service with HTTP URLs
+		discoveryService = discovery.NewBootstrapService(localNode, bootstrapURLs)
 	}
 
 	// Create latency measurer

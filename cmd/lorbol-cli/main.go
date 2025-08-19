@@ -65,5 +65,8 @@ func optimizeRoutes(cfg *config.Config) {
 
 func showStatus(cfg *config.Config) {
 	fmt.Println("LORBOL Status:")
-	fmt.Printf("Config loaded from: %s\n", cfg.ConfigPath)
+	fmt.Printf("Network: %s\n", cfg.Network.Name)
+	fmt.Printf("Node: %s\n", cfg.Node.Name)
+	fmt.Printf("Virtual IP: %s\n", cfg.Node.VirtualIP)
+	fmt.Printf("Bootstrap method: %s\n", cfg.Bootstrap.Method)
 }
