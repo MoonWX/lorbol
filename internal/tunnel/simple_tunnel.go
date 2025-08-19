@@ -258,8 +258,9 @@ func (st *SimpleTunnel) handleKeepalive(addr *net.UDPAddr) {
 }
 
 func (st *SimpleTunnel) sendHandshake(peer *TunnelPeer) error {
+	localNodeID := fmt.Sprintf("local-%s", st.localIP.String())
 	handshake := HandshakePacket{
-		NodeID:    "local-node", // This should be the actual local node ID
+		NodeID:    localNodeID,
 		VirtualIP: st.localIP.String(),
 		Timestamp: time.Now().Unix(),
 	}
@@ -319,9 +320,20 @@ func (st *SimpleTunnel) decrypt(key, nonce, ciphertext []byte) ([]byte, error) {
 }
 
 func (st *SimpleTunnel) generateSharedKey(nodeID string) []byte {
-	// Simple key derivation based on node IDs
-	// In production, use proper key exchange (ECDH, etc.)
-	hash := sha256.Sum256([]byte(fmt.Sprintf("%s-%s", "local-node", nodeID)))
+	// Generate deterministic shared key based on network name and sorted node IDs
+	// This ensures both nodes generate the same key
+	localNodeID := fmt.Sprintf("local-%s", st.localIP.String()) // Use IP as local node ID
+	
+	// Sort the node IDs to ensure deterministic order
+	var keyInput string
+	if localNodeID < nodeID {
+		keyInput = fmt.Sprintf("lorbol-network-%s-%s", localNodeID, nodeID)
+	} else {
+		keyInput = fmt.Sprintf("lorbol-network-%s-%s", nodeID, localNodeID)
+	}
+	
+	fmt.Printf("SimpleTunnel: Generating shared key with input: %s\n", keyInput)
+	hash := sha256.Sum256([]byte(keyInput))
 	return hash[:]
 }
 
