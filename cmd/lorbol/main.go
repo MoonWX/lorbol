@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -63,6 +64,84 @@ type Server struct {
 	measurer    *latency.UDPMeasurer
 	optimizer   routing.Optimizer
 	localNode   *discovery.Node
+	nodeManager *SimpleNodeManager
+}
+
+// SimpleNodeManager implements routing.NodeManager interface
+type SimpleNodeManager struct {
+	localNode *discovery.Node
+	peers     map[string]*discovery.Node
+	mu        sync.RWMutex
+}
+
+func (nm *SimpleNodeManager) GetAllNodes() []*routing.NetworkNode {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	
+	var nodes []*routing.NetworkNode
+	
+	// Add local node
+	if nm.localNode != nil {
+		nodes = append(nodes, &routing.NetworkNode{
+			ID:        nm.localNode.ID,
+			Name:      nm.localNode.Name,
+			VirtualIP: net.ParseIP(nm.localNode.VirtualIP),
+			PublicIP:  net.ParseIP(nm.localNode.PublicIP),
+			Port:      nm.localNode.Port,
+			IsOnline:  true,
+		})
+	}
+	
+	// Add peers
+	for _, peer := range nm.peers {
+		nodes = append(nodes, &routing.NetworkNode{
+			ID:        peer.ID,
+			Name:      peer.Name,
+			VirtualIP: net.ParseIP(peer.VirtualIP),
+			PublicIP:  net.ParseIP(peer.PublicIP),
+			Port:      peer.Port,
+			IsOnline:  true, // Assume discovered peers are online
+		})
+	}
+	
+	return nodes
+}
+
+func (nm *SimpleNodeManager) GetLocalNode() *routing.NetworkNode {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	
+	if nm.localNode == nil {
+		return nil
+	}
+	
+	return &routing.NetworkNode{
+		ID:        nm.localNode.ID,
+		Name:      nm.localNode.Name,
+		VirtualIP: net.ParseIP(nm.localNode.VirtualIP),
+		PublicIP:  net.ParseIP(nm.localNode.PublicIP),
+		Port:      nm.localNode.Port,
+		IsOnline:  true,
+	}
+}
+
+func (nm *SimpleNodeManager) GetOnlinePeers() []*routing.NetworkNode {
+	return nm.GetAllNodes() // For simplicity, assume all discovered peers are online
+}
+
+func (nm *SimpleNodeManager) UpdatePeers(peers []*discovery.Node) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	
+	// Clear existing peers
+	nm.peers = make(map[string]*discovery.Node)
+	
+	// Add new peers
+	for _, peer := range peers {
+		if peer.ID != nm.localNode.ID { // Don't add ourselves
+			nm.peers[peer.ID] = peer
+		}
+	}
 }
 
 func NewServer(cfg *config.Config) (*Server, error) {
@@ -134,8 +213,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		}
 	})
 	
-	// Create routing optimizer
-	optimizer := routing.NewOptimizer(cfg.Routing)
+	// Create routing optimizer with node manager
+	nodeManager := &SimpleNodeManager{
+		localNode: localNode,
+		peers:     make(map[string]*discovery.Node),
+	}
+	optimizer := routing.NewNetworkOptimizer(cfg.Routing, nodeManager)
 	
 	// Set route resolver for tunnel
 	simpleTunnel.SetRouteResolver(optimizer)
@@ -215,6 +298,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		measurer:     measurer,
 		optimizer:    optimizer,
 		localNode:    localNode,
+		nodeManager:  nodeManager,
 	}, nil
 }
 
@@ -289,6 +373,9 @@ func (s *Server) processPeers() {
 	// Get discovered peers
 	peers := s.discovery.GetKnownPeers()
 	log.Printf("Processing %d discovered peers", len(peers))
+	
+	// Update node manager with discovered peers
+	s.nodeManager.UpdatePeers(peers)
 	
 	// Add new peers to tunnel
 	for _, peer := range peers {

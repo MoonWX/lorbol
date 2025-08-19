@@ -151,7 +151,7 @@ func (st *SimpleTunnel) SendData(dstIP net.IP, data []byte) error {
 	// Try to get optimized route first
 	if st.routeResolver != nil {
 		nextHopIP, err := st.routeResolver.GetBestNextHop(dstStr)
-		if err == nil && nextHopIP != "" {
+		if err == nil && nextHopIP != "" && nextHopIP != dstStr {
 			fmt.Printf("SimpleTunnel: Using optimized route to %s via %s\n", dstStr, nextHopIP)
 			
 			// Find next hop peer
@@ -169,9 +169,10 @@ func (st *SimpleTunnel) SendData(dstIP net.IP, data []byte) error {
 				return st.sendRoutedData(nextHopPeer, dstIP, data)
 			}
 		}
+		// If err != nil, it means direct connection is preferred, continue to direct send
 	}
 	
-	// Fallback: direct connection to destination
+	// Direct connection to destination
 	fmt.Printf("SimpleTunnel: Using direct route to %s\n", dstStr)
 	st.mu.RLock()
 	var targetPeer *TunnelPeer

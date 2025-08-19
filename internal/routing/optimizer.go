@@ -95,31 +95,67 @@ func (o *optimizer) OptimizeRoute(destination string, measurements map[string]ti
 		return Route{}, fmt.Errorf("no measurements available for optimization")
 	}
 
-	var bestGateway string
-	var bestLatency time.Duration = time.Hour
-
-	for gateway, latency := range measurements {
-		if latency < bestLatency {
-			bestLatency = latency
-			bestGateway = gateway
-		}
+	// If we have node manager, use graph-based routing
+	if o.nodeManager != nil && o.localNodeID != "" {
+		return o.optimizeWithGraph(destination, measurements)
 	}
 
-	if bestGateway == "" {
-		return Route{}, fmt.Errorf("no suitable gateway found for destination %s", destination)
+	// Fallback: simple direct routing
+	return o.optimizeDirectRoute(destination, measurements)
+}
+
+func (o *optimizer) optimizeWithGraph(destination string, measurements map[string]time.Duration) (Route, error) {
+	// Update graph with current measurements
+	o.updateNetworkGraph(measurements)
+	
+	// Find shortest path using Dijkstra
+	pathResult, err := o.graph.FindShortestPath(o.localNodeID, destination)
+	if err != nil {
+		return Route{}, fmt.Errorf("no path found to %s: %w", destination, err)
+	}
+
+	var gateway string
+	if len(pathResult.Path) <= 1 {
+		return Route{}, fmt.Errorf("invalid path to %s", destination)
+	} else if len(pathResult.Path) == 2 {
+		// Direct connection
+		gateway = destination
+	} else {
+		// Multi-hop: next hop is the second node in path
+		gateway = pathResult.Path[1]
 	}
 
 	route := Route{
 		Destination: destination,
-		Gateway:     bestGateway,
-		Interface:   "tun0",
-		Latency:     bestLatency,
+		Gateway:     gateway,
+		Interface:   "lorbol0",
+		Latency:     pathResult.TotalLatency,
 		Timestamp:   time.Now(),
 	}
 
 	o.routeTable.AddRoute(route)
+	fmt.Printf("Routing: Optimized route to %s via %s (latency: %v, hops: %d)\n", 
+		destination, gateway, pathResult.TotalLatency, pathResult.HopCount)
 	
 	return route, nil
+}
+
+func (o *optimizer) optimizeDirectRoute(destination string, measurements map[string]time.Duration) (Route, error) {
+	// Check if we can reach destination directly
+	if directLatency, canDirectConnect := measurements[destination]; canDirectConnect {
+		route := Route{
+			Destination: destination,
+			Gateway:     destination, // Direct connection
+			Interface:   "lorbol0",
+			Latency:     directLatency,
+			Timestamp:   time.Now(),
+		}
+
+		o.routeTable.AddRoute(route)
+		return route, nil
+	}
+
+	return Route{}, fmt.Errorf("no direct route to destination %s available", destination)
 }
 
 func (o *optimizer) GetBestPath(destination string) (Path, error) {
@@ -141,6 +177,11 @@ func (o *optimizer) GetBestNextHop(destination string) (string, error) {
 	route, exists := o.routeTable.GetRoute(destination)
 	if !exists {
 		return "", fmt.Errorf("no route found for destination %s", destination)
+	}
+
+	// If gateway equals destination, it means direct connection
+	if route.Gateway == destination {
+		return "", fmt.Errorf("direct connection to %s, no next hop needed", destination)
 	}
 
 	// Return the gateway as next hop
