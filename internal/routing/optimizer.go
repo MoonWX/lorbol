@@ -3,6 +3,7 @@ package routing
 import (
 	"context"
 	"fmt"
+	"net"
 	"sort"
 	"sync"
 	"time"
@@ -40,6 +41,24 @@ type optimizer struct {
 	stopCh       chan struct{}
 	isRunning    bool
 	mu           sync.Mutex
+	graph        *Graph
+	nodeManager  NodeManager
+	localNodeID  string
+}
+
+type NodeManager interface {
+	GetAllNodes() []*NetworkNode
+	GetLocalNode() *NetworkNode
+	GetOnlinePeers() []*NetworkNode
+}
+
+type NetworkNode struct {
+	ID        string
+	Name      string
+	VirtualIP net.IP
+	PublicIP  net.IP
+	Port      int
+	IsOnline  bool
 }
 
 func NewOptimizer(cfg config.RoutingConfig) Optimizer {
@@ -48,6 +67,25 @@ func NewOptimizer(cfg config.RoutingConfig) Optimizer {
 		routeTable:   NewRouteTable(),
 		measurements: make(map[string]time.Duration),
 		stopCh:       make(chan struct{}),
+		graph:        NewGraph(),
+	}
+}
+
+func NewNetworkOptimizer(cfg config.RoutingConfig, nodeManager NodeManager) Optimizer {
+	localNode := nodeManager.GetLocalNode()
+	localNodeID := ""
+	if localNode != nil {
+		localNodeID = localNode.ID
+	}
+	
+	return &optimizer{
+		config:       cfg,
+		routeTable:   NewRouteTable(),
+		measurements: make(map[string]time.Duration),
+		stopCh:       make(chan struct{}),
+		graph:        NewGraph(),
+		nodeManager:  nodeManager,
+		localNodeID:  localNodeID,
 	}
 }
 
@@ -165,6 +203,106 @@ func (o *optimizer) performOptimization() {
 		return
 	}
 
+	// Update graph with current measurements if we have node manager
+	if o.nodeManager != nil {
+		o.updateNetworkGraph(measurements)
+		o.optimizeNetworkRoutes()
+	} else {
+		// Fallback to simple optimization
+		o.performSimpleOptimization(measurements)
+	}
+}
+
+func (o *optimizer) updateNetworkGraph(measurements map[string]time.Duration) {
+	nodes := o.nodeManager.GetAllNodes()
+	
+	// Add all nodes to graph
+	for _, node := range nodes {
+		virtualIP := ""
+		publicIP := ""
+		if node.VirtualIP != nil {
+			virtualIP = node.VirtualIP.String()
+		}
+		if node.PublicIP != nil {
+			publicIP = node.PublicIP.String()
+		}
+		o.graph.AddNode(node.ID, virtualIP, publicIP)
+	}
+	
+	// Add edges based on measurements
+	localNode := o.nodeManager.GetLocalNode()
+	if localNode == nil {
+		return
+	}
+	
+	for _, node := range nodes {
+		if node.ID == localNode.ID {
+			continue
+		}
+		
+		// Look for latency measurement to this node
+		var latency time.Duration
+		var found bool
+		
+		if node.VirtualIP != nil {
+			if l, exists := measurements[node.VirtualIP.String()]; exists {
+				latency = l
+				found = true
+			}
+		}
+		
+		if !found && node.PublicIP != nil {
+			if l, exists := measurements[node.PublicIP.String()]; exists {
+				latency = l
+				found = true
+			}
+		}
+		
+		if found {
+			o.graph.UpdateEdge(localNode.ID, node.ID, latency)
+		}
+	}
+	
+	// Clean up stale edges
+	o.graph.CleanupStaleEdges(5 * time.Minute)
+}
+
+func (o *optimizer) optimizeNetworkRoutes() {
+	if o.localNodeID == "" {
+		return
+	}
+	
+	// Find shortest paths to all other nodes
+	paths, err := o.graph.FindAllShortestPaths(o.localNodeID)
+	if err != nil {
+		return
+	}
+	
+	// Update route table with optimized paths
+	for nodeID, pathResult := range paths {
+		if len(pathResult.Path) > 1 {
+			nextHop := pathResult.Path[1] // Next node in the path
+			
+			// Find the node to get its virtual IP
+			nodes := o.nodeManager.GetAllNodes()
+			for _, node := range nodes {
+				if node.ID == nodeID && node.VirtualIP != nil {
+					route := Route{
+						Destination: node.VirtualIP.String(),
+						Gateway:     nextHop,
+						Interface:   "lorbol0",
+						Latency:     pathResult.TotalLatency,
+						Timestamp:   time.Now(),
+					}
+					o.routeTable.AddRoute(route)
+					break
+				}
+			}
+		}
+	}
+}
+
+func (o *optimizer) performSimpleOptimization(measurements map[string]time.Duration) {
 	destinations := o.getDestinations(measurements)
 	
 	for _, dest := range destinations {

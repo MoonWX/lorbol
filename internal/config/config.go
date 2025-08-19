@@ -11,6 +11,8 @@ import (
 type Config struct {
 	ConfigPath string         `yaml:"-"`
 	Server     ServerConfig   `yaml:"server"`
+	Network    NetworkConfig  `yaml:"network"`
+	Node       NodeConfig     `yaml:"node"`
 	Latency    LatencyConfig  `yaml:"latency"`
 	Routing    RoutingConfig  `yaml:"routing"`
 	VPN        VPNConfig      `yaml:"vpn"`
@@ -21,6 +23,24 @@ type Config struct {
 type ServerConfig struct {
 	Host string `yaml:"host"`
 	Port int    `yaml:"port"`
+}
+
+type NetworkConfig struct {
+	Name      string   `yaml:"name"`
+	CIDR      string   `yaml:"cidr"`
+	Gateway   string   `yaml:"gateway"`
+	DNSServers []string `yaml:"dns_servers"`
+	Domain    string   `yaml:"domain"`
+	MTU       int      `yaml:"mtu"`
+}
+
+type NodeConfig struct {
+	Name      string `yaml:"name"`
+	VirtualIP string `yaml:"virtual_ip"`
+	PublicIP  string `yaml:"public_ip"`
+	PrivateIP string `yaml:"private_ip"`
+	Port      int    `yaml:"port"`
+	AutoDetectIP bool `yaml:"auto_detect_ip"`
 }
 
 type LatencyConfig struct {
@@ -85,16 +105,24 @@ func (c *Config) validate() error {
 		return fmt.Errorf("invalid server port: %d", c.Server.Port)
 	}
 
+	if c.Network.CIDR == "" {
+		return fmt.Errorf("network CIDR is required")
+	}
+
+	if c.Node.VirtualIP == "" {
+		return fmt.Errorf("node virtual IP is required")
+	}
+
+	if c.Node.Port <= 0 || c.Node.Port > 65535 {
+		return fmt.Errorf("invalid node port: %d", c.Node.Port)
+	}
+
 	if c.Latency.Interval <= 0 {
 		return fmt.Errorf("latency interval must be positive")
 	}
 
 	if c.Latency.Timeout <= 0 {
 		return fmt.Errorf("latency timeout must be positive")
-	}
-
-	if len(c.Latency.TargetEndpoints) == 0 {
-		return fmt.Errorf("at least one target endpoint is required")
 	}
 
 	return nil
@@ -105,6 +133,22 @@ func DefaultConfig() *Config {
 		Server: ServerConfig{
 			Host: "localhost",
 			Port: 8080,
+		},
+		Network: NetworkConfig{
+			Name:       "lorbol-net",
+			CIDR:       "10.0.0.0/8",
+			Gateway:    "10.0.0.1",
+			DNSServers: []string{"8.8.8.8", "1.1.1.1"},
+			Domain:     "lorbol.local",
+			MTU:        1420,
+		},
+		Node: NodeConfig{
+			Name:         "lorbol-node",
+			VirtualIP:    "10.0.0.2",
+			PublicIP:     "",
+			PrivateIP:    "",
+			Port:         51820,
+			AutoDetectIP: true,
 		},
 		Latency: LatencyConfig{
 			Method:     "icmp",
@@ -117,17 +161,18 @@ func DefaultConfig() *Config {
 			},
 		},
 		Routing: RoutingConfig{
-			Algorithm:        "shortest_latency",
+			Algorithm:        "dijkstra",
 			OptimizeInterval: 5 * time.Minute,
 			LatencyThreshold: 100 * time.Millisecond,
 			MaxRetries:       3,
 		},
 		VPN: VPNConfig{
-			Interface: "tun0",
-			LocalIP:   "10.0.0.1",
-			Port:      1194,
-			Protocol:  "udp",
-			Encryption: "aes256",
+			Interface:  "lorbol0",
+			LocalIP:    "10.0.0.2",
+			RemoteIPs:  []string{},
+			Port:       51820,
+			Protocol:   "udp",
+			Encryption: "chacha20poly1305",
 		},
 		Monitor: MonitorConfig{
 			Enabled:        true,
