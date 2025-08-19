@@ -61,7 +61,7 @@ type Server struct {
 	tunnel      *tunnel.SimpleTunnel
 	discovery   *discovery.BootstrapService
 	measurer    *latency.UDPMeasurer
-	optimizer   *routing.ShortestPathOptimizer
+	optimizer   routing.Optimizer
 	localNode   *discovery.Node
 }
 
@@ -133,6 +133,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 			}
 		}
 	})
+	
+	// Create routing optimizer
+	optimizer := routing.NewOptimizer(cfg.Routing)
+	
+	// Set route resolver for tunnel
+	simpleTunnel.SetRouteResolver(optimizer)
 
 	// Create bootstrap discovery service
 	var bootstrapURLs []string
@@ -200,9 +206,6 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 	// Create latency measurer
 	measurer := latency.NewUDPMeasurer(cfg.Latency.Interval, cfg.Latency.Timeout)
-
-	// Create routing optimizer
-	optimizer := routing.NewShortestPathOptimizer(cfg.Routing.OptimizeInterval)
 
 	return &Server{
 		config:       cfg,
@@ -333,15 +336,33 @@ func (s *Server) processPeers() {
 		}
 	}
 
-	// Measure latencies to active peers
+	// Measure latencies to active peers and update routing
 	activePeers := s.tunnel.GetActivePeers()
 	log.Printf("Found %d active tunnel peers", len(activePeers))
+	
+	measurements := make(map[string]time.Duration)
 	for _, peer := range activePeers {
 		latency, err := s.measurer.MeasureLatency(peer.VirtualIP, peer.Endpoint.String())
 		if err != nil {
 			log.Printf("failed to measure latency to %s: %v", peer.VirtualIP, err)
 		} else {
 			log.Printf("latency to %s: %v", peer.VirtualIP, latency)
+			measurements[peer.VirtualIP.String()] = latency
+		}
+	}
+	
+	// Update routing optimizer with measurements
+	if len(measurements) > 0 {
+		s.optimizer.UpdateMeasurements(measurements)
+		
+		// Optimize routes for each destination
+		for dest := range measurements {
+			_, err := s.optimizer.OptimizeRoute(dest, measurements)
+			if err != nil {
+				log.Printf("Failed to optimize route to %s: %v", dest, err)
+			} else {
+				log.Printf("Optimized route to %s", dest)
+			}
 		}
 	}
 }

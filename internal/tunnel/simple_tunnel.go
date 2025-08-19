@@ -12,6 +12,11 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// RouteResolver interface for routing queries
+type RouteResolver interface {
+	GetBestNextHop(destination string) (string, error)
+}
+
 // SimpleTunnel implements a basic encrypted UDP tunnel without WireGuard dependency
 type SimpleTunnel struct {
 	localIP        net.IP
@@ -21,6 +26,7 @@ type SimpleTunnel struct {
 	mu             sync.RWMutex
 	cipher         []byte // 32-byte key for ChaCha20Poly1305
 	onDataReceived func([]byte) // Callback for received data
+	routeResolver  RouteResolver // For routing optimization
 }
 
 type TunnelPeer struct {
@@ -33,9 +39,14 @@ type TunnelPeer struct {
 }
 
 type TunnelPacket struct {
-	Type      uint8  // 1=handshake, 2=data, 3=keepalive
+	Type      uint8  // 1=handshake, 2=data, 3=keepalive, 4=routed_data
 	Nonce     [12]byte
 	Payload   []byte
+}
+
+type RoutedPacket struct {
+	FinalDestination net.IP // 最终目标IP
+	OriginalData    []byte  // 原始数据包
 }
 
 type HandshakePacket struct {
@@ -62,6 +73,10 @@ func NewSimpleTunnel(localIP net.IP, listenPort int) (*SimpleTunnel, error) {
 
 func (st *SimpleTunnel) SetDataReceivedCallback(callback func([]byte)) {
 	st.onDataReceived = callback
+}
+
+func (st *SimpleTunnel) SetRouteResolver(resolver RouteResolver) {
+	st.routeResolver = resolver
 }
 
 func (st *SimpleTunnel) Start() error {
@@ -131,7 +146,33 @@ func (st *SimpleTunnel) RemovePeer(nodeID string) error {
 }
 
 func (st *SimpleTunnel) SendData(dstIP net.IP, data []byte) error {
-	// Find peer by virtual IP
+	dstStr := dstIP.String()
+	
+	// Try to get optimized route first
+	if st.routeResolver != nil {
+		nextHopIP, err := st.routeResolver.GetBestNextHop(dstStr)
+		if err == nil && nextHopIP != "" {
+			fmt.Printf("SimpleTunnel: Using optimized route to %s via %s\n", dstStr, nextHopIP)
+			
+			// Find next hop peer
+			st.mu.RLock()
+			var nextHopPeer *TunnelPeer
+			for _, peer := range st.peers {
+				if peer.VirtualIP.String() == nextHopIP && peer.IsActive {
+					nextHopPeer = peer
+					break
+				}
+			}
+			st.mu.RUnlock()
+			
+			if nextHopPeer != nil {
+				return st.sendRoutedData(nextHopPeer, dstIP, data)
+			}
+		}
+	}
+	
+	// Fallback: direct connection to destination
+	fmt.Printf("SimpleTunnel: Using direct route to %s\n", dstStr)
 	st.mu.RLock()
 	var targetPeer *TunnelPeer
 	for _, peer := range st.peers {
@@ -174,6 +215,8 @@ func (st *SimpleTunnel) handleIncomingPackets() {
 			st.handleDataPacket(addr, nonce, payload)
 		case 3: // Keepalive
 			st.handleKeepalive(addr)
+		case 4: // Routed data
+			st.handleRoutedPacket(addr, nonce, payload)
 		}
 	}
 }
@@ -275,6 +318,59 @@ func (st *SimpleTunnel) handleKeepalive(addr *net.UDPAddr) {
 	st.mu.Unlock()
 }
 
+func (st *SimpleTunnel) handleRoutedPacket(addr *net.UDPAddr, nonce []byte, payload []byte) {
+	// Find peer who sent this
+	st.mu.RLock()
+	var peer *TunnelPeer
+	for _, p := range st.peers {
+		if p.Endpoint.String() == addr.String() && p.IsActive {
+			peer = p
+			break
+		}
+	}
+	st.mu.RUnlock()
+
+	if peer == nil {
+		return
+	}
+
+	// Decrypt routed packet
+	decrypted, err := st.decrypt(peer.SharedKey, nonce, payload)
+	if err != nil {
+		fmt.Printf("SimpleTunnel: Failed to decrypt routed packet: %v\n", err)
+		return
+	}
+
+	// Parse routed packet
+	var routedPacket RoutedPacket
+	if err := st.parseRoutedPacket(decrypted, &routedPacket); err != nil {
+		fmt.Printf("SimpleTunnel: Failed to parse routed packet: %v\n", err)
+		return
+	}
+
+	// Update last seen
+	st.mu.Lock()
+	peer.LastSeen = time.Now()
+	st.mu.Unlock()
+
+	// Check if we are the final destination
+	localIP := st.localIP
+	if routedPacket.FinalDestination.Equal(localIP) {
+		// This packet is for us - forward to TUN interface
+		fmt.Printf("SimpleTunnel: Received routed packet for local interface\n")
+		if st.onDataReceived != nil {
+			st.onDataReceived(routedPacket.OriginalData)
+		}
+	} else {
+		// Forward to next hop
+		fmt.Printf("SimpleTunnel: Forwarding routed packet to %s\n", routedPacket.FinalDestination.String())
+		err := st.SendData(routedPacket.FinalDestination, routedPacket.OriginalData)
+		if err != nil {
+			fmt.Printf("SimpleTunnel: Failed to forward routed packet: %v\n", err)
+		}
+	}
+}
+
 func (st *SimpleTunnel) sendHandshake(peer *TunnelPeer) error {
 	localNodeID := fmt.Sprintf("local-%s", st.localIP.String())
 	handshake := HandshakePacket{
@@ -293,6 +389,22 @@ func (st *SimpleTunnel) sendHandshake(peer *TunnelPeer) error {
 
 func (st *SimpleTunnel) sendEncryptedData(peer *TunnelPeer, data []byte) error {
 	return st.sendEncryptedPacket(peer, 2, data)
+}
+
+func (st *SimpleTunnel) sendRoutedData(nextHopPeer *TunnelPeer, finalDest net.IP, data []byte) error {
+	// Create routed packet
+	routedPacket := RoutedPacket{
+		FinalDestination: finalDest,
+		OriginalData:    data,
+	}
+	
+	// Serialize routed packet
+	serialized, err := st.serializeRoutedPacket(&routedPacket)
+	if err != nil {
+		return err
+	}
+	
+	return st.sendEncryptedPacket(nextHopPeer, 4, serialized)
 }
 
 func (st *SimpleTunnel) sendEncryptedPacket(peer *TunnelPeer, packetType uint8, data []byte) error {
@@ -382,6 +494,48 @@ func (st *SimpleTunnel) parseHandshake(data []byte, hs *HandshakePacket) error {
 	hs.NodeID = string(parts[0])
 	hs.VirtualIP = string(parts[1])
 	hs.Timestamp = int64(binary.BigEndian.Uint64(data[start:start+8]))
+	
+	return nil
+}
+
+func (st *SimpleTunnel) serializeRoutedPacket(rp *RoutedPacket) ([]byte, error) {
+	// Simple binary serialization: 16 bytes for IP + length(4) + data
+	data := make([]byte, 0, 20+len(rp.OriginalData))
+	
+	// Add destination IP (16 bytes for IPv6 compatibility)
+	ipBytes := rp.FinalDestination.To16()
+	data = append(data, ipBytes...)
+	
+	// Add data length (4 bytes)
+	dataLen := make([]byte, 4)
+	binary.BigEndian.PutUint32(dataLen, uint32(len(rp.OriginalData)))
+	data = append(data, dataLen...)
+	
+	// Add original data
+	data = append(data, rp.OriginalData...)
+	
+	return data, nil
+}
+
+func (st *SimpleTunnel) parseRoutedPacket(data []byte, rp *RoutedPacket) error {
+	if len(data) < 20 {
+		return fmt.Errorf("routed packet too short")
+	}
+	
+	// Parse destination IP (16 bytes)
+	rp.FinalDestination = net.IP(data[0:16])
+	
+	// Parse data length (4 bytes)
+	dataLen := binary.BigEndian.Uint32(data[16:20])
+	
+	// Check if we have enough data
+	if len(data) < 20+int(dataLen) {
+		return fmt.Errorf("routed packet data truncated")
+	}
+	
+	// Parse original data
+	rp.OriginalData = make([]byte, dataLen)
+	copy(rp.OriginalData, data[20:20+dataLen])
 	
 	return nil
 }

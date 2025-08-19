@@ -14,6 +14,7 @@ import (
 type Optimizer interface {
 	OptimizeRoute(destination string, measurements map[string]time.Duration) (Route, error)
 	GetBestPath(destination string) (Path, error)
+	GetBestNextHop(destination string) (string, error)
 	UpdateMeasurements(measurements map[string]time.Duration)
 	Start(ctx context.Context) error
 	Stop() error
@@ -134,6 +135,16 @@ func (o *optimizer) GetBestPath(destination string) (Path, error) {
 	}
 
 	return path, nil
+}
+
+func (o *optimizer) GetBestNextHop(destination string) (string, error) {
+	route, exists := o.routeTable.GetRoute(destination)
+	if !exists {
+		return "", fmt.Errorf("no route found for destination %s", destination)
+	}
+
+	// Return the gateway as next hop
+	return route.Gateway, nil
 }
 
 func (o *optimizer) UpdateMeasurements(measurements map[string]time.Duration) {
@@ -331,7 +342,7 @@ func (o *optimizer) getDestinations(measurements map[string]time.Duration) []str
 	return destinations
 }
 
-func (o *optimizer) getGatewayMeasurements(destination string, allMeasurements map[string]time.Duration) map[string]time.Duration {
+func (o *optimizer) getGatewayMeasurements(_ string, allMeasurements map[string]time.Duration) map[string]time.Duration {
 	gatewayMeasurements := make(map[string]time.Duration)
 	
 	for target, latency := range allMeasurements {
