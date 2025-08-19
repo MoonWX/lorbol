@@ -442,9 +442,12 @@ func (s *Server) processPeers() {
 	if len(measurements) > 0 {
 		s.optimizer.UpdateMeasurements(measurements)
 		
+		// Collect ALL known latencies from the graph for intelligent routing
+		allLatencies := s.collectAllKnownLatencies(measurements)
+		
 		// Optimize routes for each destination
 		for dest := range measurements {
-			_, err := s.optimizer.OptimizeRoute(dest, measurements)
+			_, err := s.optimizer.OptimizeRoute(dest, allLatencies)
 			if err != nil {
 				log.Printf("Failed to optimize route to %s: %v", dest, err)
 			} else {
@@ -452,6 +455,26 @@ func (s *Server) processPeers() {
 			}
 		}
 	}
+}
+
+// collectAllKnownLatencies gathers latencies from all sources
+func (s *Server) collectAllKnownLatencies(directMeasurements map[string]time.Duration) map[string]time.Duration {
+	allLatencies := make(map[string]time.Duration)
+	
+	// Add our direct measurements
+	for dest, latency := range directMeasurements {
+		allLatencies[dest] = latency
+	}
+	
+	// TODO: In future, we could:
+	// 1. Query other nodes for their latency tables
+	// 2. Use gossip protocol to share latency information
+	// 3. Implement distributed routing table synchronization
+	
+	// For now, we assume other nodes will share their measurements
+	// through some mechanism (could be periodic broadcasts)
+	
+	return allLatencies
 }
 
 func (s *Server) forwardPackets(ctx context.Context) {

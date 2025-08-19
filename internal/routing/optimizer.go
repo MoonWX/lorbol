@@ -105,37 +105,54 @@ func (o *optimizer) OptimizeRoute(destination string, measurements map[string]ti
 }
 
 func (o *optimizer) optimizeWithGraph(destination string, measurements map[string]time.Duration) (Route, error) {
-	// Update graph with current measurements
+	// In a fullmesh network, find the LOWEST LATENCY path (not shortest path)
+	// We need to consider: direct vs 2-hop paths based on total latency
+	
+	// Method 1: Direct connection
+	directLatency, hasDirectConnection := measurements[destination]
+	if !hasDirectConnection {
+		return Route{}, fmt.Errorf("no direct connection to destination %s", destination)
+	}
+	
+	bestLatency := directLatency
+	bestGateway := destination // Direct connection by default
+	bestPath := "direct"
+	
+	// Method 2: Check 2-hop paths through intermediate nodes
+	// We'll use the graph to store all known latencies between nodes
 	o.updateNetworkGraph(measurements)
 	
-	// Find shortest path using Dijkstra
-	pathResult, err := o.graph.FindShortestPath(o.localNodeID, destination)
-	if err != nil {
-		return Route{}, fmt.Errorf("no path found to %s: %w", destination, err)
+	// Try to find better 2-hop paths
+	for intermediateNode, latencyToIntermediate := range measurements {
+		if intermediateNode == destination {
+			continue // Skip destination itself
+		}
+		
+		// Check if we have latency from intermediate to destination
+		if edge, exists := o.graph.GetEdge(intermediateNode, destination); exists {
+			latencyIntermediateToDestination := edge.Latency
+			totalLatency := latencyToIntermediate + latencyIntermediateToDestination
+			
+			if totalLatency < bestLatency {
+				bestLatency = totalLatency
+				bestGateway = intermediateNode
+				bestPath = fmt.Sprintf("via %s", intermediateNode)
+				fmt.Printf("Routing: Found better 2-hop path to %s via %s: %v (vs direct %v)\n", 
+					destination, intermediateNode, totalLatency, directLatency)
+			}
+		}
 	}
-
-	var gateway string
-	if len(pathResult.Path) <= 1 {
-		return Route{}, fmt.Errorf("invalid path to %s", destination)
-	} else if len(pathResult.Path) == 2 {
-		// Direct connection
-		gateway = destination
-	} else {
-		// Multi-hop: next hop is the second node in path
-		gateway = pathResult.Path[1]
-	}
-
+	
 	route := Route{
 		Destination: destination,
-		Gateway:     gateway,
+		Gateway:     bestGateway,
 		Interface:   "lorbol0",
-		Latency:     pathResult.TotalLatency,
+		Latency:     bestLatency,
 		Timestamp:   time.Now(),
 	}
 
 	o.routeTable.AddRoute(route)
-	fmt.Printf("Routing: Optimized route to %s via %s (latency: %v, hops: %d)\n", 
-		destination, gateway, pathResult.TotalLatency, pathResult.HopCount)
+	fmt.Printf("Routing: Best latency route to %s: %s (%v)\n", destination, bestPath, bestLatency)
 	
 	return route, nil
 }
