@@ -126,25 +126,39 @@ func NewServer(cfg *config.Config) (*Server, error) {
 			if staticPeers, ok := staticPeersInterface.([]interface{}); ok {
 				for _, peerInterface := range staticPeers {
 					if peerStr, ok := peerInterface.(string); ok {
-						// Parse peer endpoint (e.g., "8.211.175.127:51820")
-						parts := strings.Split(peerStr, ":")
-						if len(parts) == 2 {
-							publicIP := parts[0]
-							var port int
-							if _, err := fmt.Sscanf(parts[1], "%d", &port); err == nil {
-								// Create a static peer node
-								staticPeer := &discovery.Node{
-									ID:        fmt.Sprintf("static-%s", publicIP),
-									Name:      fmt.Sprintf("static-peer-%s", publicIP),
-									VirtualIP: "", // Will be discovered during handshake
-									PublicIP:  publicIP,
-									Port:      port,
-									Network:   cfg.Network.Name,
-									Timestamp: time.Now().Unix(),
-								}
-								discoveryService.AddKnownPeer(staticPeer)
-								log.Printf("Added static peer: %s:%d", publicIP, port)
+						// Parse peer endpoint (e.g., "8.211.175.127:51820" or "[::1]:51820")
+						var publicIP string
+						var port int
+						
+						if strings.HasPrefix(peerStr, "[") {
+							// IPv6 format: [::1]:51820
+							if endBracket := strings.Index(peerStr, "]"); endBracket != -1 {
+								publicIP = peerStr[1:endBracket]
+								portPart := peerStr[endBracket+2:] // Skip ]:
+								fmt.Sscanf(portPart, "%d", &port)
 							}
+						} else {
+							// IPv4 format: 1.2.3.4:51820
+							parts := strings.Split(peerStr, ":")
+							if len(parts) == 2 {
+								publicIP = parts[0]
+								fmt.Sscanf(parts[1], "%d", &port)
+							}
+						}
+						
+						if publicIP != "" && port > 0 {
+							// Create a static peer node
+							staticPeer := &discovery.Node{
+								ID:        fmt.Sprintf("static-%s", publicIP),
+								Name:      fmt.Sprintf("static-peer-%s", publicIP),
+								VirtualIP: "", // Will be discovered during handshake
+								PublicIP:  publicIP,
+								Port:      port,
+								Network:   cfg.Network.Name,
+								Timestamp: time.Now().Unix(),
+							}
+							discoveryService.AddKnownPeer(staticPeer)
+							log.Printf("Added static peer: %s:%d", publicIP, port)
 						}
 					}
 				}
@@ -260,7 +274,15 @@ func (s *Server) processPeers() {
 		log.Printf("Checking peer: %s (ID:%s, PublicIP:%s, VirtualIP:%s)", peer.Name, peer.ID, peer.PublicIP, peer.VirtualIP)
 		
 		if peer.ID != s.localNode.ID && peer.PublicIP != "" {
-			endpoint := fmt.Sprintf("%s:%d", peer.PublicIP, peer.Port)
+			// Handle IPv6 addresses properly
+			var endpoint string
+			if strings.Contains(peer.PublicIP, ":") {
+				// IPv6 address needs brackets
+				endpoint = fmt.Sprintf("[%s]:%d", peer.PublicIP, peer.Port)
+			} else {
+				// IPv4 address
+				endpoint = fmt.Sprintf("%s:%d", peer.PublicIP, peer.Port)
+			}
 			
 			// For static peers, we need to set their virtual IP from our knowledge
 			// Since static discovery doesn't know their virtual IP initially
