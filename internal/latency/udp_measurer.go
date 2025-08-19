@@ -21,7 +21,7 @@ func (u *UDPMeasurer) MeasureLatency(targetIP net.IP, endpoint string) (time.Dur
 	start := time.Now()
 	
 	// Create UDP connection
-	conn, err := net.DialTimeout("udp", endpoint, u.timeout)
+	conn, err := net.DialTimeout("udp4", endpoint, u.timeout)
 	if err != nil {
 		return 0, err
 	}

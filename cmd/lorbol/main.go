@@ -553,7 +553,7 @@ func (s *Server) chooseBestEndpoint(peer *discovery.Node) string {
 func (s *Server) testEndpointLatency(endpoint string) (time.Duration, error) {
 	start := time.Now()
 	
-	conn, err := net.DialTimeout("udp", endpoint, 3*time.Second)
+	conn, err := net.DialTimeout("udp4", endpoint, 3*time.Second)
 	if err != nil {
 		return 0, err
 	}
