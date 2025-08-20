@@ -49,6 +49,16 @@ type optimizer struct {
 	// Distributed latency information from all nodes
 	distributedLatencies map[string]map[string]time.Duration // nodeID -> {destination -> latency}
 	distributedMu        sync.RWMutex
+	// Route stability tracking
+	routeHistory         map[string][]RouteCandidate // destination -> recent route candidates
+	routeChangePending   map[string]time.Time        // destination -> when change was first considered
+	routeHistoryMu       sync.RWMutex
+}
+
+type RouteCandidate struct {
+	Gateway   string
+	Latency   time.Duration
+	Timestamp time.Time
 }
 
 type NodeManager interface {
@@ -74,6 +84,8 @@ func NewOptimizer(cfg config.RoutingConfig) Optimizer {
 		stopCh:               make(chan struct{}),
 		graph:                NewGraph(),
 		distributedLatencies: make(map[string]map[string]time.Duration),
+		routeHistory:         make(map[string][]RouteCandidate),
+		routeChangePending:   make(map[string]time.Time),
 	}
 }
 
@@ -93,6 +105,8 @@ func NewNetworkOptimizer(cfg config.RoutingConfig, nodeManager NodeManager) Opti
 		nodeManager:          nodeManager,
 		localNodeID:          localNodeID,
 		distributedLatencies: make(map[string]map[string]time.Duration),
+		routeHistory:         make(map[string][]RouteCandidate),
+		routeChangePending:   make(map[string]time.Time),
 	}
 }
 
@@ -175,7 +189,7 @@ func (o *optimizer) optimizeWithGraph(destination string, measurements map[strin
 		pathDescription = fmt.Sprintf("via %s", nextHopNodeID)
 	}
 
-	route := Route{
+	newRoute := Route{
 		Destination: destination,
 		Gateway:     gateway,
 		Interface:   "lorbol0",
@@ -183,11 +197,22 @@ func (o *optimizer) optimizeWithGraph(destination string, measurements map[strin
 		Timestamp:   time.Now(),
 	}
 
-	o.routeTable.AddRoute(route)
-	fmt.Printf("Routing: Best latency route to %s: %s (%v, %d hops)\n", 
-		destination, pathDescription, pathResult.TotalLatency, pathResult.HopCount)
+	// Check if we should actually apply this route change (stability check)
+	if o.shouldUpdateRoute(destination, gateway, pathResult.TotalLatency) {
+		o.routeTable.AddRoute(newRoute)
+		fmt.Printf("Routing: Applied stable route to %s: %s (%v, %d hops)\n", 
+			destination, pathDescription, pathResult.TotalLatency, pathResult.HopCount)
+		
+		// Clear any pending change since we applied it
+		o.routeHistoryMu.Lock()
+		delete(o.routeChangePending, destination)
+		o.routeHistoryMu.Unlock()
+	} else {
+		fmt.Printf("Routing: Route change to %s pending stability check: %s (%v, %d hops)\n", 
+			destination, pathDescription, pathResult.TotalLatency, pathResult.HopCount)
+	}
 	
-	return route, nil
+	return newRoute, nil
 }
 
 func (o *optimizer) buildCompleteLatencyGraph() {
@@ -266,6 +291,184 @@ func (o *optimizer) findVirtualIPByNodeID(nodeID string) string {
 		}
 	}
 	return ""
+}
+
+// shouldUpdateRoute implements route stability checking similar to WireGuard
+func (o *optimizer) shouldUpdateRoute(destination, newGateway string, newLatency time.Duration) bool {
+	o.routeHistoryMu.Lock()
+	defer o.routeHistoryMu.Unlock()
+	
+	// Get current route
+	currentRoute, hasCurrentRoute := o.routeTable.GetRoute(destination)
+	
+	// If no current route, allow the new route immediately
+	if !hasCurrentRoute {
+		fmt.Printf("Routing: No existing route to %s, applying new route immediately\n", destination)
+		return true
+	}
+	
+	// If it's the same gateway, always allow updates (just latency changes)
+	if currentRoute.Gateway == newGateway {
+		return true
+	}
+	
+	// Different gateway - check if the improvement is significant and stable
+	improvementThreshold := 20 * time.Millisecond // Must be at least 20ms better
+	stabilityDuration := 30 * time.Second         // Must be stable for 30 seconds
+	
+	latencyImprovement := currentRoute.Latency - newLatency
+	if latencyImprovement < improvementThreshold {
+		fmt.Printf("Routing: Route change to %s rejected - improvement too small: %v < %v\n", 
+			destination, latencyImprovement, improvementThreshold)
+		return false
+	}
+	
+	// Track this route candidate
+	candidate := RouteCandidate{
+		Gateway:   newGateway,
+		Latency:   newLatency,
+		Timestamp: time.Now(),
+	}
+	
+	// Add to history
+	if o.routeHistory[destination] == nil {
+		o.routeHistory[destination] = make([]RouteCandidate, 0)
+	}
+	o.routeHistory[destination] = append(o.routeHistory[destination], candidate)
+	
+	// Keep only recent candidates (last 2 minutes)
+	cutoff := time.Now().Add(-2 * time.Minute)
+	recent := make([]RouteCandidate, 0)
+	for _, c := range o.routeHistory[destination] {
+		if c.Timestamp.After(cutoff) {
+			recent = append(recent, c)
+		}
+	}
+	o.routeHistory[destination] = recent
+	
+	// Check if this gateway has been consistently better for the stability duration
+	if pendingTime, isPending := o.routeChangePending[destination]; isPending {
+		// Already considering this change
+		if time.Since(pendingTime) >= stabilityDuration {
+			// Check if the new gateway has been consistently better
+			consistent := true
+			for _, c := range recent {
+				if c.Gateway == newGateway {
+					// This gateway should consistently show improvement
+					if (currentRoute.Latency - c.Latency) < improvementThreshold {
+						consistent = false
+						break
+					}
+				}
+			}
+			
+			if consistent {
+				fmt.Printf("Routing: Route change to %s approved after stability check (%v)\n", 
+					destination, time.Since(pendingTime))
+				return true
+			}
+		}
+	} else {
+		// Start considering this change
+		o.routeChangePending[destination] = time.Now()
+		fmt.Printf("Routing: Route change to %s under consideration for stability check\n", destination)
+	}
+	
+	return false
+}
+
+// periodicRouteDiscovery implements WireGuard-style automatic route discovery
+func (o *optimizer) periodicRouteDiscovery() {
+	// Every few minutes, probe alternative paths to ensure we have the best routes
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		if o.nodeManager == nil {
+			continue
+		}
+		
+		nodes := o.nodeManager.GetAllNodes()
+		for _, node := range nodes {
+			if node.ID == o.localNodeID || node.VirtualIP == nil {
+				continue
+			}
+			
+			destination := node.VirtualIP.String()
+			
+			// Check if we have multiple potential paths to this destination
+			o.exploreAlternativePaths(destination)
+		}
+	}
+}
+
+func (o *optimizer) exploreAlternativePaths(destination string) {
+	// Try to find alternative paths through different intermediate nodes
+	// This is similar to WireGuard's automatic path discovery
+	
+	if o.nodeManager == nil {
+		return
+	}
+	
+	allNodes := o.nodeManager.GetAllNodes()
+	localNode := o.nodeManager.GetLocalNode()
+	if localNode == nil {
+		return
+	}
+	
+	// Find potential intermediate nodes
+	var intermediates []*NetworkNode
+	for _, node := range allNodes {
+		if node.ID != localNode.ID && node.VirtualIP != nil && node.VirtualIP.String() != destination {
+			intermediates = append(intermediates, node)
+		}
+	}
+	
+	fmt.Printf("Routing: Exploring alternative paths to %s through %d intermediates\n", 
+		destination, len(intermediates))
+	
+	// For each intermediate, estimate the 2-hop path cost
+	for _, intermediate := range intermediates {
+		o.probePathViaIntermediate(destination, intermediate)
+	}
+}
+
+func (o *optimizer) probePathViaIntermediate(destination string, intermediate *NetworkNode) {
+	// This would probe the path: local -> intermediate -> destination
+	// In a full implementation, this would send probe packets through the intermediate
+	
+	intermediateIP := intermediate.VirtualIP.String()
+	
+	// Get current latencies
+	o.measuresMu.RLock()
+	latencyToIntermediate, hasToIntermediate := o.measurements[intermediateIP]
+	latencyToDest, hasToDest := o.measurements[destination]
+	o.measuresMu.RUnlock()
+	
+	if !hasToIntermediate {
+		return
+	}
+	
+	// Estimate 2-hop latency (this is simplified - real implementation would probe)
+	var estimatedViaIntermediate time.Duration
+	if hasToDest {
+		// If we have direct measurement, the 2-hop path needs to be significantly better
+		estimatedViaIntermediate = latencyToIntermediate + (latencyToDest / 2) // Simplified estimation
+	} else {
+		// No direct path known, estimate based on intermediate latency
+		estimatedViaIntermediate = latencyToIntermediate + (50 * time.Millisecond) // Conservative estimate
+	}
+	
+	fmt.Printf("Routing: Estimated path %s -> %s -> %s: %v\n", 
+		o.localNodeID, intermediate.ID, destination, estimatedViaIntermediate)
+		
+	// Update distributed latencies with this estimation
+	o.distributedMu.Lock()
+	if o.distributedLatencies[o.localNodeID] == nil {
+		o.distributedLatencies[o.localNodeID] = make(map[string]time.Duration)
+	}
+	o.distributedLatencies[o.localNodeID][destination] = estimatedViaIntermediate
+	o.distributedMu.Unlock()
 }
 
 func (o *optimizer) optimizeDirectRoute(destination string, measurements map[string]time.Duration) (Route, error) {
@@ -352,6 +555,11 @@ func (o *optimizer) Start(ctx context.Context) error {
 	o.stopCh = make(chan struct{})
 
 	go o.optimizationLoop(ctx)
+	
+	// Start WireGuard-style route discovery if we have a node manager
+	if o.nodeManager != nil {
+		go o.periodicRouteDiscovery()
+	}
 	
 	return nil
 }
