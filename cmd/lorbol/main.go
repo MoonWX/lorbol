@@ -766,45 +766,28 @@ func (s *Server) fallbackEndpointTest(endpoint string) (time.Duration, error) {
 }
 
 func (s *Server) measureNodeLatency(node *routing.NetworkNode) (time.Duration, error) {
-	// First try direct connection if this node is an active peer
-	activePeers := s.tunnel.GetActivePeers()
-	for _, peer := range activePeers {
-		if peer.VirtualIP.Equal(node.VirtualIP) {
-			// This is a direct peer, measure directly
-			return s.measurer.MeasureLatency(peer.VirtualIP, peer.Endpoint.String())
-		}
+	// Always measure using the node's public IP, not virtual IP
+	var publicIP string
+	var port int = node.Port
+	
+	// Choose best public IP (prefer IPv4)
+	if node.PublicIP != nil {
+		publicIP = node.PublicIP.String()
+	} else {
+		return 0, fmt.Errorf("node %s has no public IP", node.ID)
 	}
 	
-	// If not a direct peer, try to reach via application-level ping through the tunnel
-	// This is similar to WireGuard's ability to ping through the network
-	return s.measureThroughTunnel(node.VirtualIP)
+	// Create endpoint for measurement
+	var endpoint string
+	if strings.Contains(publicIP, ":") {
+		// IPv6
+		endpoint = fmt.Sprintf("[%s]:%d", publicIP, port)
+	} else {
+		// IPv4
+		endpoint = fmt.Sprintf("%s:%d", publicIP, port)
+	}
+	
+	// Measure latency to public endpoint
+	return s.measurer.MeasureLatency(nil, endpoint)
 }
 
-func (s *Server) measureThroughTunnel(targetIP net.IP) (time.Duration, error) {
-	// Try to ping the target through our virtual network
-	// This will use the current best route (even if it's through intermediate nodes)
-	
-	// Use system ping through the TUN interface
-	start := time.Now()
-	
-	// Create a simple ICMP ping packet and send it through the tunnel
-	pingData := []byte("LORBOL ping test")
-	
-	// Send the ping through the tunnel - this will use current routing
-	err := s.tunnel.SendData(targetIP, pingData)
-	if err != nil {
-		return 0, fmt.Errorf("failed to send ping through tunnel: %w", err)
-	}
-	
-	// For now, estimate based on send time
-	// In a proper implementation, we'd wait for a response
-	estimatedLatency := time.Since(start)
-	
-	// Add some realistic network latency estimation
-	if estimatedLatency < 10*time.Millisecond {
-		estimatedLatency = 10 * time.Millisecond
-	}
-	
-	// This is a simplified approach - ideally we'd implement proper ICMP echo/reply
-	return estimatedLatency, nil
-}
