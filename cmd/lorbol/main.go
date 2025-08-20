@@ -222,6 +222,11 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	
 	// Set route resolver for tunnel
 	simpleTunnel.SetRouteResolver(optimizer)
+	
+	// Set latency callback for distributed routing
+	simpleTunnel.SetLatencyCallback(func(sourceNodeID string, measurements map[string]time.Duration) {
+		optimizer.UpdateDistributedLatencies(sourceNodeID, measurements)
+	})
 
 	// Create bootstrap discovery service
 	var bootstrapURLs []string
@@ -454,6 +459,9 @@ func (s *Server) processPeers() {
 				log.Printf("Optimized route to %s", dest)
 			}
 		}
+		
+		// Broadcast our latency measurements to other nodes
+		s.tunnel.BroadcastLatencyInfo(s.localNode.ID, measurements)
 	}
 }
 

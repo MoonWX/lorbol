@@ -16,6 +16,7 @@ type Optimizer interface {
 	GetBestPath(destination string) (Path, error)
 	GetBestNextHop(destination string) (string, error)
 	UpdateMeasurements(measurements map[string]time.Duration)
+	UpdateDistributedLatencies(sourceNodeID string, measurements map[string]time.Duration)
 	Start(ctx context.Context) error
 	Stop() error
 }
@@ -45,6 +46,9 @@ type optimizer struct {
 	graph        *Graph
 	nodeManager  NodeManager
 	localNodeID  string
+	// Distributed latency information from all nodes
+	distributedLatencies map[string]map[string]time.Duration // nodeID -> {destination -> latency}
+	distributedMu        sync.RWMutex
 }
 
 type NodeManager interface {
@@ -64,11 +68,12 @@ type NetworkNode struct {
 
 func NewOptimizer(cfg config.RoutingConfig) Optimizer {
 	return &optimizer{
-		config:       cfg,
-		routeTable:   NewRouteTable(),
-		measurements: make(map[string]time.Duration),
-		stopCh:       make(chan struct{}),
-		graph:        NewGraph(),
+		config:               cfg,
+		routeTable:           NewRouteTable(),
+		measurements:         make(map[string]time.Duration),
+		stopCh:               make(chan struct{}),
+		graph:                NewGraph(),
+		distributedLatencies: make(map[string]map[string]time.Duration),
 	}
 }
 
@@ -80,13 +85,14 @@ func NewNetworkOptimizer(cfg config.RoutingConfig, nodeManager NodeManager) Opti
 	}
 	
 	return &optimizer{
-		config:       cfg,
-		routeTable:   NewRouteTable(),
-		measurements: make(map[string]time.Duration),
-		stopCh:       make(chan struct{}),
-		graph:        NewGraph(),
-		nodeManager:  nodeManager,
-		localNodeID:  localNodeID,
+		config:               cfg,
+		routeTable:           NewRouteTable(),
+		measurements:         make(map[string]time.Duration),
+		stopCh:               make(chan struct{}),
+		graph:                NewGraph(),
+		nodeManager:          nodeManager,
+		localNodeID:          localNodeID,
+		distributedLatencies: make(map[string]map[string]time.Duration),
 	}
 }
 
@@ -105,56 +111,95 @@ func (o *optimizer) OptimizeRoute(destination string, measurements map[string]ti
 }
 
 func (o *optimizer) optimizeWithGraph(destination string, measurements map[string]time.Duration) (Route, error) {
-	// In a fullmesh network, find the LOWEST LATENCY path (not shortest path)
-	// We need to consider: direct vs 2-hop paths based on total latency
+	// Build complete latency graph from all distributed information
+	o.buildCompleteLatencyGraph()
 	
-	// Method 1: Direct connection
-	directLatency, hasDirectConnection := measurements[destination]
-	if !hasDirectConnection {
-		return Route{}, fmt.Errorf("no direct connection to destination %s", destination)
-	}
-	
-	bestLatency := directLatency
-	bestGateway := destination // Direct connection by default
-	bestPath := "direct"
-	
-	// Method 2: Check 2-hop paths through intermediate nodes
-	// We'll use the graph to store all known latencies between nodes
-	o.updateNetworkGraph(measurements)
-	
-	// Try to find better 2-hop paths
-	for intermediateNode, latencyToIntermediate := range measurements {
-		if intermediateNode == destination {
-			continue // Skip destination itself
-		}
-		
-		// Check if we have latency from intermediate to destination
-		if edge, exists := o.graph.GetEdge(intermediateNode, destination); exists {
-			latencyIntermediateToDestination := edge.Latency
-			totalLatency := latencyToIntermediate + latencyIntermediateToDestination
-			
-			if totalLatency < bestLatency {
-				bestLatency = totalLatency
-				bestGateway = intermediateNode
-				bestPath = fmt.Sprintf("via %s", intermediateNode)
-				fmt.Printf("Routing: Found better 2-hop path to %s via %s: %v (vs direct %v)\n", 
-					destination, intermediateNode, totalLatency, directLatency)
+	// Find the shortest latency path using Dijkstra
+	pathResult, err := o.graph.FindShortestPath(o.localNodeID, destination)
+	if err != nil {
+		// Fallback to direct connection if no path found
+		if directLatency, hasDirectConnection := measurements[destination]; hasDirectConnection {
+			route := Route{
+				Destination: destination,
+				Gateway:     destination,
+				Interface:   "lorbol0",
+				Latency:     directLatency,
+				Timestamp:   time.Now(),
 			}
+			o.routeTable.AddRoute(route)
+			fmt.Printf("Routing: Fallback to direct route to %s (%v)\n", destination, directLatency)
+			return route, nil
 		}
+		return Route{}, fmt.Errorf("no path found to %s: %w", destination, err)
 	}
-	
+
+	var gateway string
+	var pathDescription string
+	if len(pathResult.Path) <= 1 {
+		return Route{}, fmt.Errorf("invalid path to %s", destination)
+	} else if len(pathResult.Path) == 2 {
+		// Direct connection
+		gateway = destination
+		pathDescription = "direct"
+	} else {
+		// Multi-hop: next hop is the second node in path
+		gateway = pathResult.Path[1]
+		pathDescription = fmt.Sprintf("via %s", gateway)
+	}
+
 	route := Route{
 		Destination: destination,
-		Gateway:     bestGateway,
+		Gateway:     gateway,
 		Interface:   "lorbol0",
-		Latency:     bestLatency,
+		Latency:     pathResult.TotalLatency,
 		Timestamp:   time.Now(),
 	}
 
 	o.routeTable.AddRoute(route)
-	fmt.Printf("Routing: Best latency route to %s: %s (%v)\n", destination, bestPath, bestLatency)
+	fmt.Printf("Routing: Best latency route to %s: %s (%v, %d hops)\n", 
+		destination, pathDescription, pathResult.TotalLatency, pathResult.HopCount)
 	
 	return route, nil
+}
+
+func (o *optimizer) buildCompleteLatencyGraph() {
+	// Clear existing graph
+	o.graph = NewGraph()
+	
+	// Add all known nodes
+	if o.nodeManager != nil {
+		nodes := o.nodeManager.GetAllNodes()
+		for _, node := range nodes {
+			virtualIP := ""
+			if node.VirtualIP != nil {
+				virtualIP = node.VirtualIP.String()
+			}
+			o.graph.AddNode(node.ID, virtualIP, "")
+		}
+	}
+	
+	// Add edges from our direct measurements
+	o.measuresMu.RLock()
+	localMeasurements := make(map[string]time.Duration)
+	for dest, latency := range o.measurements {
+		localMeasurements[dest] = latency
+	}
+	o.measuresMu.RUnlock()
+	
+	for dest, latency := range localMeasurements {
+		o.graph.UpdateEdge(o.localNodeID, dest, latency)
+	}
+	
+	// Add edges from distributed latency information
+	o.distributedMu.RLock()
+	for sourceNodeID, measurements := range o.distributedLatencies {
+		for dest, latency := range measurements {
+			o.graph.UpdateEdge(sourceNodeID, dest, latency)
+		}
+	}
+	o.distributedMu.RUnlock()
+	
+	fmt.Printf("Routing: Built complete latency graph with %d nodes\n", len(o.graph.nodes))
 }
 
 func (o *optimizer) optimizeDirectRoute(destination string, measurements map[string]time.Duration) (Route, error) {
@@ -212,6 +257,19 @@ func (o *optimizer) UpdateMeasurements(measurements map[string]time.Duration) {
 	for target, latency := range measurements {
 		o.measurements[target] = latency
 	}
+}
+
+func (o *optimizer) UpdateDistributedLatencies(sourceNodeID string, measurements map[string]time.Duration) {
+	o.distributedMu.Lock()
+	defer o.distributedMu.Unlock()
+	
+	o.distributedLatencies[sourceNodeID] = make(map[string]time.Duration)
+	for dest, latency := range measurements {
+		o.distributedLatencies[sourceNodeID][dest] = latency
+	}
+	
+	fmt.Printf("Routing: Updated distributed latencies from %s (%d measurements)\n", 
+		sourceNodeID, len(measurements))
 }
 
 func (o *optimizer) Start(ctx context.Context) error {

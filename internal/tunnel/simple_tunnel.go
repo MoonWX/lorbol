@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net"
 	"sync"
@@ -26,7 +27,8 @@ type SimpleTunnel struct {
 	mu             sync.RWMutex
 	cipher         []byte // 32-byte key for ChaCha20Poly1305
 	onDataReceived func([]byte) // Callback for received data
-	routeResolver  RouteResolver // For routing optimization
+	routeResolver    RouteResolver // For routing optimization
+	latencyCallback  func(string, map[string]time.Duration) // Callback for received latency info
 }
 
 type TunnelPeer struct {
@@ -39,7 +41,7 @@ type TunnelPeer struct {
 }
 
 type TunnelPacket struct {
-	Type      uint8  // 1=handshake, 2=data, 3=keepalive, 4=routed_data
+	Type      uint8  // 1=handshake, 2=data, 3=keepalive, 4=routed_data, 5=latency_info
 	Nonce     [12]byte
 	Payload   []byte
 }
@@ -47,6 +49,12 @@ type TunnelPacket struct {
 type RoutedPacket struct {
 	FinalDestination net.IP // 最终目标IP
 	OriginalData    []byte  // 原始数据包
+}
+
+type LatencyInfo struct {
+	SourceNodeID string                        // 发送此信息的节点ID
+	Measurements map[string]time.Duration      // 延迟测量表: 目标IP -> 延迟
+	Timestamp    int64                         // 时间戳
 }
 
 type HandshakePacket struct {
@@ -77,6 +85,35 @@ func (st *SimpleTunnel) SetDataReceivedCallback(callback func([]byte)) {
 
 func (st *SimpleTunnel) SetRouteResolver(resolver RouteResolver) {
 	st.routeResolver = resolver
+}
+
+func (st *SimpleTunnel) SetLatencyCallback(callback func(string, map[string]time.Duration)) {
+	st.latencyCallback = callback
+}
+
+func (st *SimpleTunnel) BroadcastLatencyInfo(sourceNodeID string, measurements map[string]time.Duration) {
+	latencyInfo := LatencyInfo{
+		SourceNodeID: sourceNodeID,
+		Measurements: measurements,
+		Timestamp:    time.Now().Unix(),
+	}
+	
+	serialized, err := st.serializeLatencyInfo(&latencyInfo)
+	if err != nil {
+		fmt.Printf("SimpleTunnel: Failed to serialize latency info: %v\n", err)
+		return
+	}
+	
+	// Broadcast to all active peers
+	st.mu.RLock()
+	for _, peer := range st.peers {
+		if peer.IsActive {
+			st.sendEncryptedPacket(peer, 5, serialized)
+		}
+	}
+	st.mu.RUnlock()
+	
+	fmt.Printf("SimpleTunnel: Broadcasted latency info from %s to %d peers\n", sourceNodeID, len(st.peers))
 }
 
 func (st *SimpleTunnel) Start() error {
@@ -218,6 +255,8 @@ func (st *SimpleTunnel) handleIncomingPackets() {
 			st.handleKeepalive(addr)
 		case 4: // Routed data
 			st.handleRoutedPacket(addr, nonce, payload)
+		case 5: // Latency info
+			st.handleLatencyInfo(addr, nonce, payload)
 		}
 	}
 }
@@ -369,6 +408,50 @@ func (st *SimpleTunnel) handleRoutedPacket(addr *net.UDPAddr, nonce []byte, payl
 		if err != nil {
 			fmt.Printf("SimpleTunnel: Failed to forward routed packet: %v\n", err)
 		}
+	}
+}
+
+func (st *SimpleTunnel) handleLatencyInfo(addr *net.UDPAddr, nonce []byte, payload []byte) {
+	// Find peer who sent this
+	st.mu.RLock()
+	var peer *TunnelPeer
+	for _, p := range st.peers {
+		if p.Endpoint.String() == addr.String() && p.IsActive {
+			peer = p
+			break
+		}
+	}
+	st.mu.RUnlock()
+
+	if peer == nil {
+		return
+	}
+
+	// Decrypt latency info
+	decrypted, err := st.decrypt(peer.SharedKey, nonce, payload)
+	if err != nil {
+		fmt.Printf("SimpleTunnel: Failed to decrypt latency info: %v\n", err)
+		return
+	}
+
+	// Parse latency info
+	var latencyInfo LatencyInfo
+	if err := st.parseLatencyInfo(decrypted, &latencyInfo); err != nil {
+		fmt.Printf("SimpleTunnel: Failed to parse latency info: %v\n", err)
+		return
+	}
+
+	// Update last seen
+	st.mu.Lock()
+	peer.LastSeen = time.Now()
+	st.mu.Unlock()
+
+	fmt.Printf("SimpleTunnel: Received latency info from %s (%d measurements)\n", 
+		latencyInfo.SourceNodeID, len(latencyInfo.Measurements))
+
+	// Forward to routing optimizer
+	if st.latencyCallback != nil {
+		st.latencyCallback(latencyInfo.SourceNodeID, latencyInfo.Measurements)
 	}
 }
 
@@ -586,4 +669,18 @@ func (st *SimpleTunnel) GetActivePeers() []*TunnelPeer {
 	}
 
 	return activePeers
+}
+
+func (st *SimpleTunnel) serializeLatencyInfo(li *LatencyInfo) ([]byte, error) {
+	// Simple JSON serialization for latency info
+	jsonData, err := json.Marshal(li)
+	if err != nil {
+		return nil, err
+	}
+	return jsonData, nil
+}
+
+func (st *SimpleTunnel) parseLatencyInfo(data []byte, li *LatencyInfo) error {
+	// Simple JSON deserialization
+	return json.Unmarshal(data, li)
 }
