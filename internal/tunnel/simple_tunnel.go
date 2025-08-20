@@ -188,29 +188,38 @@ func (st *SimpleTunnel) SendData(dstIP net.IP, data []byte) error {
 	// Try to get optimized route first
 	if st.routeResolver != nil {
 		nextHopIP, err := st.routeResolver.GetBestNextHop(dstStr)
-		if err == nil && nextHopIP != "" && nextHopIP != dstStr {
-			fmt.Printf("SimpleTunnel: Using optimized route to %s via %s\n", dstStr, nextHopIP)
-			
-			// Find next hop peer
-			st.mu.RLock()
-			var nextHopPeer *TunnelPeer
-			for _, peer := range st.peers {
-				if peer.VirtualIP.String() == nextHopIP && peer.IsActive {
-					nextHopPeer = peer
-					break
+		if err == nil {
+			if nextHopIP != "" && nextHopIP != dstStr {
+				// Multi-hop routing: send via next hop
+				fmt.Printf("SimpleTunnel: Using multi-hop route to %s via %s\n", dstStr, nextHopIP)
+				
+				// Find next hop peer
+				st.mu.RLock()
+				var nextHopPeer *TunnelPeer
+				for _, peer := range st.peers {
+					if peer.VirtualIP.String() == nextHopIP && peer.IsActive {
+						nextHopPeer = peer
+						break
+					}
 				}
+				st.mu.RUnlock()
+				
+				if nextHopPeer != nil {
+					return st.sendRoutedData(nextHopPeer, dstIP, data)
+				} else {
+					fmt.Printf("SimpleTunnel: Next hop peer %s not found, falling back to direct\n", nextHopIP)
+				}
+			} else {
+				// nextHopIP == "" means direct connection is optimal
+				fmt.Printf("SimpleTunnel: Using optimized direct route to %s\n", dstStr)
 			}
-			st.mu.RUnlock()
-			
-			if nextHopPeer != nil {
-				return st.sendRoutedData(nextHopPeer, dstIP, data)
-			}
+		} else {
+			fmt.Printf("SimpleTunnel: Route resolution failed for %s: %v, using direct\n", dstStr, err)
 		}
-		// If err != nil, it means direct connection is preferred, continue to direct send
 	}
 	
 	// Direct connection to destination
-	fmt.Printf("SimpleTunnel: Using direct route to %s\n", dstStr)
+	fmt.Printf("SimpleTunnel: Sending directly to %s\n", dstStr)
 	st.mu.RLock()
 	var targetPeer *TunnelPeer
 	for _, peer := range st.peers {

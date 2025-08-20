@@ -160,10 +160,19 @@ func (o *optimizer) optimizeWithGraph(destination string, measurements map[strin
 		// Direct connection
 		gateway = destination
 		pathDescription = "direct"
+		fmt.Printf("Routing: Direct path calculated: %s -> %s\n", o.localNodeID, destinationNodeID)
 	} else {
-		// Multi-hop: next hop is the second node in path
-		gateway = pathResult.Path[1]
-		pathDescription = fmt.Sprintf("via %s", gateway)
+		// Multi-hop: next hop is the second node in path (convert node ID to virtual IP)
+		nextHopNodeID := pathResult.Path[1]
+		gateway = o.findVirtualIPByNodeID(nextHopNodeID)
+		if gateway == "" {
+			gateway = nextHopNodeID // Fallback to node ID
+			fmt.Printf("Routing: WARNING - Could not find virtual IP for next hop node %s\n", nextHopNodeID)
+		} else {
+			fmt.Printf("Routing: Multi-hop path calculated: %s -> %s -> %s (next hop: %s)\n", 
+				o.localNodeID, nextHopNodeID, destinationNodeID, gateway)
+		}
+		pathDescription = fmt.Sprintf("via %s", nextHopNodeID)
 	}
 
 	route := Route{
@@ -245,6 +254,20 @@ func (o *optimizer) findNodeIDByVirtualIP(virtualIP string) string {
 	return ""
 }
 
+func (o *optimizer) findVirtualIPByNodeID(nodeID string) string {
+	if o.nodeManager == nil {
+		return ""
+	}
+	
+	nodes := o.nodeManager.GetAllNodes()
+	for _, node := range nodes {
+		if node.ID == nodeID && node.VirtualIP != nil {
+			return node.VirtualIP.String()
+		}
+	}
+	return ""
+}
+
 func (o *optimizer) optimizeDirectRoute(destination string, measurements map[string]time.Duration) (Route, error) {
 	// Check if we can reach destination directly
 	if directLatency, canDirectConnect := measurements[destination]; canDirectConnect {
@@ -284,12 +307,12 @@ func (o *optimizer) GetBestNextHop(destination string) (string, error) {
 		return "", fmt.Errorf("no route found for destination %s", destination)
 	}
 
-	// If gateway equals destination, it means direct connection
+	// If gateway equals destination, it means direct connection - return empty string to indicate direct
 	if route.Gateway == destination {
-		return "", fmt.Errorf("direct connection to %s, no next hop needed", destination)
+		return "", nil
 	}
 
-	// Return the gateway as next hop
+	// Return the gateway as next hop for multi-hop routing
 	return route.Gateway, nil
 }
 
