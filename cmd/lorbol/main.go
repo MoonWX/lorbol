@@ -676,6 +676,24 @@ func (s *Server) chooseBestEndpoint(peer *discovery.Node) string {
 }
 
 func (s *Server) testEndpointLatency(endpoint string) (time.Duration, error) {
+	// Extract IP from endpoint
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		host = endpoint
+	}
+	
+	// Use ICMP ping for accurate latency measurement
+	pinger := &latency.ICMPPinger{}
+	latency, err := pinger.Ping(host, 3*time.Second)
+	if err != nil {
+		// Fallback to UDP test if ICMP fails
+		return s.fallbackEndpointTest(endpoint)
+	}
+	
+	return latency, nil
+}
+
+func (s *Server) fallbackEndpointTest(endpoint string) (time.Duration, error) {
 	start := time.Now()
 	
 	conn, err := net.DialTimeout("udp4", endpoint, 3*time.Second)
@@ -690,5 +708,14 @@ func (s *Server) testEndpointLatency(endpoint string) (time.Duration, error) {
 		return 0, err
 	}
 	
-	return time.Since(start), nil
+	// Better estimation for fallback
+	connectionTime := time.Since(start)
+	estimatedLatency := connectionTime * 8
+	
+	minLatency := 5 * time.Millisecond
+	if estimatedLatency < minLatency {
+		estimatedLatency = minLatency
+	}
+	
+	return estimatedLatency, nil
 }
