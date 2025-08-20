@@ -361,15 +361,30 @@ func (s *Server) managePeers(ctx context.Context) {
 	// Initial peer management
 	s.processPeers()
 	
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+	// More frequent peer management during startup (first 2 minutes)
+	startupTicker := time.NewTicker(5 * time.Second)
+	normalTicker := time.NewTicker(30 * time.Second)
+	defer startupTicker.Stop()
+	defer normalTicker.Stop()
+	
+	startupPhase := true
+	startupEnd := time.After(2 * time.Minute)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			s.processPeers()
+		case <-startupEnd:
+			startupPhase = false
+			log.Printf("Switching to normal peer management interval")
+		case <-startupTicker.C:
+			if startupPhase {
+				s.processPeers()
+			}
+		case <-normalTicker.C:
+			if !startupPhase {
+				s.processPeers()
+			}
 		}
 	}
 }
@@ -515,7 +530,7 @@ func (s *Server) forwardPackets(ctx context.Context) {
 			
 			// Only forward packets destined for our virtual network
 			if !virtualNet.Contains(dstIP) {
-				log.Printf("Ignoring packet to %s (outside virtual network %s)", dstIP, s.config.Network.CIDR)
+				// Don't spam logs with ignored packets
 				continue
 			}
 			

@@ -124,10 +124,12 @@ func (bs *BootstrapService) discoveryLoop(ctx context.Context) {
 }
 
 func (bs *BootstrapService) performDiscovery() {
-	// Try multiple discovery methods
-	bs.discoverViaBootstrapServers()
-	bs.discoverViaGitHub()
-	bs.discoverViaDNS()
+	// Only use configured discovery methods
+	if len(bs.bootstrapURLs) > 0 {
+		bs.discoverViaBootstrapServers()
+	}
+	
+	// Always test reachability of known peers
 	bs.discoverViaDirectConnect()
 }
 
@@ -295,14 +297,12 @@ func (bs *BootstrapService) discoverViaGitHub() {
 func (bs *BootstrapService) registerToGitHub() error {
 	// TODO: Implement GitHub-based node registration
 	// This would use GitHub API to create/update a file with node info
-	fmt.Printf("GitHub Discovery: Would register node %s (IP: %s)\n", bs.localNode.Name, bs.localNode.PublicIP)
 	return nil
 }
 
 func (bs *BootstrapService) queryGitHubNodes() []*Node {
 	// TODO: Implement GitHub-based node discovery  
 	// This would query a GitHub repository for nodes.json file
-	fmt.Printf("GitHub Discovery: Would query for nodes in network %s\n", bs.localNode.Network)
 	return []*Node{}
 }
 
@@ -310,6 +310,5 @@ func (bs *BootstrapService) queryGitHubNodes() []*Node {
 func (bs *BootstrapService) discoverViaDNS() []*Node {
 	// This would implement DNS TXT record discovery
 	// e.g., _lorbol._udp.example.com TXT "node=id:abc,ip:1.2.3.4,port:51820"
-	fmt.Printf("DNS Discovery: Would query _lorbol._udp.%s for TXT records\n", bs.localNode.Network)
 	return []*Node{}
 }

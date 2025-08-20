@@ -285,8 +285,9 @@ func (st *SimpleTunnel) handleHandshake(addr *net.UDPAddr, nonce []byte, payload
 	st.mu.RUnlock()
 
 	if peer == nil {
-		fmt.Printf("SimpleTunnel: Unknown peer %s, ignoring handshake\n", addr.String())
-		return // Unknown peer
+		// Don't spam logs with unknown peer messages
+		// Let the discovery system handle peer management
+		return
 	}
 
 	// Decrypt handshake payload

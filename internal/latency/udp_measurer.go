@@ -95,16 +95,16 @@ func (u *UDPMeasurer) fallbackUDPTest(endpoint string) (time.Duration, error) {
 }
 
 func (u *UDPMeasurer) systemPing(host string) (time.Duration, error) {
-	// Use system ping command - works on both IPv4 and IPv6
+	// Use system ping command with multiple packets to handle packet loss
 	var cmd *exec.Cmd
 	
 	// Check if it's IPv6 address
 	if strings.Contains(host, ":") {
-		// IPv6 ping
-		cmd = exec.Command("ping6", "-c", "1", "-W", "3", host)
+		// IPv6 ping: send 3 packets, wait up to 5 seconds
+		cmd = exec.Command("ping6", "-c", "3", "-W", "5", host)
 	} else {
-		// IPv4 ping
-		cmd = exec.Command("ping", "-c", "1", "-W", "3", host)
+		// IPv4 ping: send 3 packets, wait up to 5 seconds
+		cmd = exec.Command("ping", "-c", "3", "-W", "5", host)
 	}
 	
 	output, err := cmd.Output()
@@ -112,22 +112,44 @@ func (u *UDPMeasurer) systemPing(host string) (time.Duration, error) {
 		return 0, fmt.Errorf("ping command failed: %w", err)
 	}
 	
-	// Parse ping output to extract latency
-	// Look for patterns like "time=123.456 ms" or "time=123.456ms"
-	re := regexp.MustCompile(`time[=:](\d+\.?\d*)\s*ms`)
-	matches := re.FindStringSubmatch(string(output))
+	// Parse ping output to extract average latency from statistics
+	// Look for "avg" in statistics line like: "min/avg/max = 10.1/15.2/20.3 ms"
+	avgRe := regexp.MustCompile(`min/avg/max.*?=.*?(\d+\.?\d*)/(\d+\.?\d*)/(\d+\.?\d*)\s*ms`)
+	avgMatches := avgRe.FindStringSubmatch(string(output))
 	
-	if len(matches) < 2 {
+	if len(avgMatches) >= 3 {
+		avgLatencyMs, err := strconv.ParseFloat(avgMatches[2], 64) // avg is the second value
+		if err == nil {
+			return time.Duration(avgLatencyMs * float64(time.Millisecond)), nil
+		}
+	}
+	
+	// Fallback: look for individual ping times and calculate average
+	timeRe := regexp.MustCompile(`time[=:](\d+\.?\d*)\s*ms`)
+	timeMatches := timeRe.FindAllStringSubmatch(string(output), -1)
+	
+	if len(timeMatches) == 0 {
 		return 0, fmt.Errorf("could not parse ping output: %s", string(output))
 	}
 	
-	latencyMs, err := strconv.ParseFloat(matches[1], 64)
-	if err != nil {
-		return 0, fmt.Errorf("could not parse latency value: %s", matches[1])
+	// Calculate average of successful pings
+	var totalLatency float64
+	successfulPings := 0
+	
+	for _, match := range timeMatches {
+		if len(match) >= 2 {
+			latencyMs, err := strconv.ParseFloat(match[1], 64)
+			if err == nil {
+				totalLatency += latencyMs
+				successfulPings++
+			}
+		}
 	}
 	
-	// Convert to time.Duration
-	latency := time.Duration(latencyMs * float64(time.Millisecond))
+	if successfulPings == 0 {
+		return 0, fmt.Errorf("no successful pings in output")
+	}
 	
-	return latency, nil
+	avgLatency := totalLatency / float64(successfulPings)
+	return time.Duration(avgLatency * float64(time.Millisecond)), nil
 }
