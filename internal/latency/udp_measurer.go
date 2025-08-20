@@ -3,6 +3,10 @@ package latency
 import (
 	"fmt"
 	"net"
+	"os/exec"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,25 +30,40 @@ func (u *UDPMeasurer) MeasureLatency(targetIP net.IP, endpoint string) (time.Dur
 		host = endpoint
 	}
 	
-	// Use ICMP ping for accurate latency measurement
-	pinger := &ICMPPinger{}
-	latency, err := pinger.Ping(host, u.timeout)
+	// Use system ping command for most accurate measurement
+	latency, err := u.systemPing(host)
 	if err != nil {
-		fmt.Printf("UDPMeasurer: ICMP ping failed for %s: %v, using UDP fallback\n", host, err)
+		fmt.Printf("UDPMeasurer: System ping failed for %s: %v, using UDP fallback\n", host, err)
 		return u.fallbackUDPTest(endpoint)
 	}
 	
-	fmt.Printf("UDPMeasurer: ICMP ping to %s: %v\n", host, latency)
+	fmt.Printf("UDPMeasurer: System ping to %s: %v\n", host, latency)
 	return latency, nil
 }
 
 func (u *UDPMeasurer) fallbackUDPTest(endpoint string) (time.Duration, error) {
+	// Skip IPv6 endpoints entirely to avoid complexity
+	if strings.Contains(endpoint, "[") && strings.Contains(endpoint, "]") {
+		return 0, fmt.Errorf("IPv6 endpoints not supported in fallback mode")
+	}
+	
+	// Extract host for validation
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return 0, fmt.Errorf("invalid endpoint format: %s", endpoint)
+	}
+	
+	// Validate it's an IPv4 address
+	if ip := net.ParseIP(host); ip == nil || ip.To4() == nil {
+		return 0, fmt.Errorf("only IPv4 addresses supported in fallback mode: %s", host)
+	}
+	
 	start := time.Now()
 	
-	// Create UDP connection
+	// Create UDP connection with IPv4 only  
 	conn, err := net.DialTimeout("udp4", endpoint, u.timeout)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("UDP connection failed to %s: %w", endpoint, err)
 	}
 	defer conn.Close()
 	
@@ -54,15 +73,61 @@ func (u *UDPMeasurer) fallbackUDPTest(endpoint string) (time.Duration, error) {
 		return 0, err
 	}
 	
-	// Estimate network latency (better than pure connection time)
+	// Estimate network latency based on connection time
 	connectionTime := time.Since(start)
-	estimatedLatency := connectionTime * 10 // Heuristic multiplier
 	
-	// Ensure minimum realistic latency
-	minLatency := 5 * time.Millisecond
+	// More realistic estimation: connection setup is typically 1-3x RTT
+	estimatedLatency := connectionTime * 2
+	
+	// Ensure minimum realistic latency for network connections
+	minLatency := 10 * time.Millisecond
 	if estimatedLatency < minLatency {
 		estimatedLatency = minLatency
 	}
 	
+	// Cap maximum to avoid unrealistic values
+	maxLatency := 5 * time.Second
+	if estimatedLatency > maxLatency {
+		estimatedLatency = maxLatency
+	}
+	
 	return estimatedLatency, nil
+}
+
+func (u *UDPMeasurer) systemPing(host string) (time.Duration, error) {
+	// Use system ping command - works on both IPv4 and IPv6
+	var cmd *exec.Cmd
+	
+	// Check if it's IPv6 address
+	if strings.Contains(host, ":") {
+		// IPv6 ping
+		cmd = exec.Command("ping6", "-c", "1", "-W", "3", host)
+	} else {
+		// IPv4 ping
+		cmd = exec.Command("ping", "-c", "1", "-W", "3", host)
+	}
+	
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, fmt.Errorf("ping command failed: %w", err)
+	}
+	
+	// Parse ping output to extract latency
+	// Look for patterns like "time=123.456 ms" or "time=123.456ms"
+	re := regexp.MustCompile(`time[=:](\d+\.?\d*)\s*ms`)
+	matches := re.FindStringSubmatch(string(output))
+	
+	if len(matches) < 2 {
+		return 0, fmt.Errorf("could not parse ping output: %s", string(output))
+	}
+	
+	latencyMs, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return 0, fmt.Errorf("could not parse latency value: %s", matches[1])
+	}
+	
+	// Convert to time.Duration
+	latency := time.Duration(latencyMs * float64(time.Millisecond))
+	
+	return latency, nil
 }

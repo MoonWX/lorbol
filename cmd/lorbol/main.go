@@ -607,8 +607,8 @@ func (s *Server) chooseBestEndpoint(peer *discovery.Node) string {
 		isIPv6   bool
 	}
 	
-	// Add IPv4 endpoint if available and we have IPv4 connectivity
-	if peer.PublicIPv4 != "" && s.localNode.PublicIPv4 != "" {
+	// Always prefer IPv4 for better compatibility, add IPv4 endpoint if available
+	if peer.PublicIPv4 != "" {
 		candidates = append(candidates, struct {
 			endpoint string
 			isIPv6   bool
@@ -618,8 +618,8 @@ func (s *Server) chooseBestEndpoint(peer *discovery.Node) string {
 		})
 	}
 	
-	// Add IPv6 endpoint if available and we have IPv6 connectivity  
-	if peer.PublicIPv6 != "" && s.localNode.PublicIPv6 != "" {
+	// Only add IPv6 if IPv4 is not available (to avoid complexity)
+	if peer.PublicIPv4 == "" && peer.PublicIPv6 != "" {
 		candidates = append(candidates, struct {
 			endpoint string
 			isIPv6   bool
@@ -690,15 +690,15 @@ func (s *Server) testEndpointLatency(endpoint string) (time.Duration, error) {
 		host = endpoint
 	}
 	
-	// Use ICMP ping for accurate latency measurement
-	pinger := &latency.ICMPPinger{}
-	latency, err := pinger.Ping(host, 3*time.Second)
+	// Use system ping command for most accurate measurement
+	measurer := s.measurer
+	latency, err := measurer.MeasureLatency(nil, endpoint)
 	if err != nil {
-		log.Printf("ICMP ping failed for %s: %v, using UDP fallback", host, err)
+		log.Printf("System ping failed for %s: %v, using UDP fallback", host, err)
 		return s.fallbackEndpointTest(endpoint)
 	}
 	
-	log.Printf("ICMP ping to %s: %v", host, latency)
+	log.Printf("System ping to %s: %v", host, latency)
 	return latency, nil
 }
 
