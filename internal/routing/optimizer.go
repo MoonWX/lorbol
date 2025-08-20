@@ -115,7 +115,26 @@ func (o *optimizer) optimizeWithGraph(destination string, measurements map[strin
 	o.buildCompleteLatencyGraph()
 	
 	// Find the shortest latency path using Dijkstra
-	pathResult, err := o.graph.FindShortestPath(o.localNodeID, destination)
+	destinationNodeID := o.findNodeIDByVirtualIP(destination)
+	if destinationNodeID == "" {
+		// Fallback if we can't find the node ID
+		if directLatency, hasDirectConnection := measurements[destination]; hasDirectConnection {
+			route := Route{
+				Destination: destination,
+				Gateway:     destination,
+				Interface:   "lorbol0",
+				Latency:     directLatency,
+				Timestamp:   time.Now(),
+			}
+			o.routeTable.AddRoute(route)
+			fmt.Printf("Routing: Cannot find node ID for %s, using direct route (%v)\n", destination, directLatency)
+			return route, nil
+		}
+		return Route{}, fmt.Errorf("cannot find node ID for destination %s", destination)
+	}
+	
+	fmt.Printf("Routing: Finding path from %s to %s (VIP: %s)\n", o.localNodeID, destinationNodeID, destination)
+	pathResult, err := o.graph.FindShortestPath(o.localNodeID, destinationNodeID)
 	if err != nil {
 		// Fallback to direct connection if no path found
 		if directLatency, hasDirectConnection := measurements[destination]; hasDirectConnection {
@@ -175,6 +194,7 @@ func (o *optimizer) buildCompleteLatencyGraph() {
 				virtualIP = node.VirtualIP.String()
 			}
 			o.graph.AddNode(node.ID, virtualIP, "")
+			fmt.Printf("Routing: Added node %s (VIP: %s)\n", node.ID, virtualIP)
 		}
 	}
 	
@@ -187,19 +207,42 @@ func (o *optimizer) buildCompleteLatencyGraph() {
 	o.measuresMu.RUnlock()
 	
 	for dest, latency := range localMeasurements {
-		o.graph.UpdateEdge(o.localNodeID, dest, latency)
+		// Convert virtual IP to node ID
+		destNodeID := o.findNodeIDByVirtualIP(dest)
+		if destNodeID != "" {
+			o.graph.UpdateEdge(o.localNodeID, destNodeID, latency)
+			fmt.Printf("Routing: Added edge %s -> %s: %v\n", o.localNodeID, destNodeID, latency)
+		}
 	}
 	
 	// Add edges from distributed latency information
 	o.distributedMu.RLock()
 	for sourceNodeID, measurements := range o.distributedLatencies {
 		for dest, latency := range measurements {
-			o.graph.UpdateEdge(sourceNodeID, dest, latency)
+			destNodeID := o.findNodeIDByVirtualIP(dest)
+			if destNodeID != "" {
+				o.graph.UpdateEdge(sourceNodeID, destNodeID, latency)
+				fmt.Printf("Routing: Added distributed edge %s -> %s: %v\n", sourceNodeID, destNodeID, latency)
+			}
 		}
 	}
 	o.distributedMu.RUnlock()
 	
 	fmt.Printf("Routing: Built complete latency graph with %d nodes\n", len(o.graph.nodes))
+}
+
+func (o *optimizer) findNodeIDByVirtualIP(virtualIP string) string {
+	if o.nodeManager == nil {
+		return ""
+	}
+	
+	nodes := o.nodeManager.GetAllNodes()
+	for _, node := range nodes {
+		if node.VirtualIP != nil && node.VirtualIP.String() == virtualIP {
+			return node.ID
+		}
+	}
+	return ""
 }
 
 func (o *optimizer) optimizeDirectRoute(destination string, measurements map[string]time.Duration) (Route, error) {
@@ -268,8 +311,10 @@ func (o *optimizer) UpdateDistributedLatencies(sourceNodeID string, measurements
 		o.distributedLatencies[sourceNodeID][dest] = latency
 	}
 	
-	fmt.Printf("Routing: Updated distributed latencies from %s (%d measurements)\n", 
-		sourceNodeID, len(measurements))
+	fmt.Printf("Routing: Updated distributed latencies from %s:\n", sourceNodeID)
+	for dest, latency := range measurements {
+		fmt.Printf("  %s -> %s: %v\n", sourceNodeID, dest, latency)
+	}
 }
 
 func (o *optimizer) Start(ctx context.Context) error {

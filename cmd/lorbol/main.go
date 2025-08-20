@@ -694,10 +694,11 @@ func (s *Server) testEndpointLatency(endpoint string) (time.Duration, error) {
 	pinger := &latency.ICMPPinger{}
 	latency, err := pinger.Ping(host, 3*time.Second)
 	if err != nil {
-		// Fallback to UDP test if ICMP fails
+		log.Printf("ICMP ping failed for %s: %v, using UDP fallback", host, err)
 		return s.fallbackEndpointTest(endpoint)
 	}
 	
+	log.Printf("ICMP ping to %s: %v", host, latency)
 	return latency, nil
 }
 

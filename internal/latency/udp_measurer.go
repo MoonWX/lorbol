@@ -1,6 +1,7 @@
 package latency
 
 import (
+	"fmt"
 	"net"
 	"time"
 )
@@ -29,10 +30,11 @@ func (u *UDPMeasurer) MeasureLatency(targetIP net.IP, endpoint string) (time.Dur
 	pinger := &ICMPPinger{}
 	latency, err := pinger.Ping(host, u.timeout)
 	if err != nil {
-		// Fallback to UDP connection test if ICMP fails (e.g., no permissions)
+		fmt.Printf("UDPMeasurer: ICMP ping failed for %s: %v, using UDP fallback\n", host, err)
 		return u.fallbackUDPTest(endpoint)
 	}
 	
+	fmt.Printf("UDPMeasurer: ICMP ping to %s: %v\n", host, latency)
 	return latency, nil
 }
 
